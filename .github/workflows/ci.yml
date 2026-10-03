@@ -1,0 +1,91 @@
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # lnurlcash-kernel compiles Bitcoin Core's kernel from source
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libboost-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # the kernel build takes minutes; keep it between runs
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # real bitcoind, real LDK nodes, real payments: mint, melt, restarts,
+  # crashes, and lnurlcash-conformance's grader against the live mint
+  regtest:
+    runs-on: ubuntu-latest
+    env:
+      BITCOIN_VERSION: "31.1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libboost-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      - name: Fetch Bitcoin Core
+        run: |
+          base=https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION
+          file=bitcoin-$BITCOIN_VERSION-x86_64-linux-gnu.tar.gz
+          curl -sfLO $base/$file
+          curl -sfLO $base/SHA256SUMS
+          grep " $file\$" SHA256SUMS | sha256sum -c -
+          tar xzf $file
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: python3 scripts/regtest_e2e.py
+        env:
+          BITCOIN_BIN: bitcoin-${{ env.BITCOIN_VERSION }}/bin
+          MINT_BIN: target/debug/lnurl-mint
+          CONFORM: "1"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: lnurl-mint:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # without bitcoind the image still serves, and says why it can't mint
+      - name: Smoke test
+        run: |
+          docker run -d --name mint -p 8111:8111 -e BASE_URL=http://localhost:8111 lnurl-mint:ci
+          for i in $(seq 30); do curl -sf localhost:8111/.well-known/lnurlp/_ && break; sleep 1; done
+          curl -sf localhost:8111/.well-known/lnurlp/_ | grep withdrawLink
+          curl -sf "localhost:8111/p/cb?amount=50000&comment=$(printf '0%.0s' {1..64})" | grep 'temporarily unavailable'
+          docker stop -t 60 mint
+
+  # the package (whose build runs cargo test), the module, and a NixOS VM
+  # running bitcoind on regtest with the mint as its own node
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - run: nix flake check -L

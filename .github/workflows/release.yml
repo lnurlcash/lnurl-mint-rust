@@ -1,0 +1,83 @@
+name: Release
+
+# on every version tag push (e.g. `git tag v0.1.0 && git push origin v0.1.0`):
+# builds and pushes lnurlcash/lnurl-mint-rust to Docker Hub, and creates a
+# GitHub Release with notes auto-generated from the commits/PRs since the
+# previous tag. The docker job requires the repo secrets DOCKERHUB_USERNAME and
+# DOCKERHUB_TOKEN (a Docker Hub access token, not the account password -
+# create one at https://hub.docker.com/settings/security); github-release
+# needs no extra secret, just the default GITHUB_TOKEN.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    # least-privilege: this job authenticates to Docker Hub via repo
+    # secrets, not GITHUB_TOKEN - it only ever reads the checked-out code
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # the binary reports Cargo.toml's version (`lnurl-mint --version`): a
+      # tag that disagrees with it would ship an image lying about itself
+      - name: Tag matches Cargo.toml
+        env:
+          tag: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$tag" ]; then
+            echo "tag $tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # from tag v1.2.0, produces the tags lnurlcash/lnurl-mint-rust:1.2.0,
+      # :1.2, :1, and :latest (docker/metadata-action's default semver pattern)
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: lnurlcash/lnurl-mint-rust
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      # amd64 only: Bitcoin Core's kernel under QEMU emulation would take
+      # hours to build for arm64
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  github-release:
+    runs-on: ubuntu-24.04
+    needs: docker
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+        run: gh release create "$tag" --generate-notes

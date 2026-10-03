@@ -1,0 +1,62 @@
+[package]
+name = "lnurl-mint"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87.0"
+description = "LNURLcash mint (LUD-25 bearer notes, LUD-26 derivation and Lightning Address) that is its own Lightning node, on LDK and BDK"
+license = "MIT"
+
+[[bin]]
+name = "lnurl-mint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+env_logger = "0.11"
+log = "0.4"
+
+# The node. LDK 0.2 and BDK 3.2 share bitcoin 0.32. BDK persists through its
+# file store, not its `rusqlite` feature: that pins rusqlite 0.31, and two
+# libsqlite3-sys cannot link into one binary.
+bitcoin = "0.32"
+lightning = "0.2"
+lightning-background-processor = "0.2"
+lightning-block-sync = { version = "0.2", features = ["rpc-client", "tokio"] }
+lightning-invoice = { version = "0.34", features = ["std"] }
+lightning-net-tokio = "0.2"
+lightning-persister = { version = "0.2", features = ["tokio"] }
+bdk_wallet = { version = "3.2", features = ["file_store"] }
+base64 = "0.22"
+
+lnurlcash-core = "0.2.3"
+# Bitcoin Core's script interpreter, built from source and linked statically
+lnurlcash-kernel = "0.2.3"
+# the versions lnurlcash-core uses. LDK brings its own secp256k1 0.29: the two
+# meet only as byte arrays.
+secp256k1 = "0.33"
+bech32 = "0.12"
+
+hex = "0.4"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+rand = "0.9"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.optimized]
+inherits = "release"
+panic = "abort"
+strip = true
+codegen-units = 1
+lto = "fat"
+debug = false

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Mint admin</title>
+<link rel="stylesheet" href="admin.css">
+<script src="admin.js" defer></script>
+</head>
+<body>
+<main id="login" class="login" hidden>
+  <form id="login-form" class="card login-card" autocomplete="off">
+    <h1>Mint admin</h1>
+    <p class="muted">Sign in with the mint's <code>ADMIN_TOKEN</code>.</p>
+    <label for="token">Admin token</label>
+    <input id="token" name="token" type="password" required autofocus spellcheck="false">
+    <button type="submit" class="primary">Sign in</button>
+    <p id="login-error" class="error" role="alert" hidden></p>
+  </form>
+</main>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="status-dot" aria-hidden="true"></span>
+      <strong id="title">Mint admin</strong>
+      <span class="muted" id="subtitle"></span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+      <button role="tab" data-tab="channels">Channels</button>
+      <button role="tab" data-tab="payments">Payments</button>
+      <button role="tab" data-tab="wallet">Wallet</button>
+      <button role="tab" data-tab="notes">Notes</button>
+    </nav>
+    <button id="logout" class="ghost">Sign out</button>
+  </header>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <main id="view" class="view"></main>
+</div>
+</body>
+</html>

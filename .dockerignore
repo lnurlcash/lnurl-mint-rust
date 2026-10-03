@@ -1,0 +1,7 @@
+/target
+/data
+/result
+.git
+.env
+*.sqlite3
+*.sqlite3-*
