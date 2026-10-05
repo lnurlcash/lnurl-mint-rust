@@ -162,7 +162,7 @@
               };
             testScript = ''
               cli = "bitcoin-cli -regtest -rpcuser=mint -rpcpassword=vm-test"
-              admin = "curl -sf -H 'Authorization: Bearer vm-test' http://127.0.0.1:8112"
+              admin = "curl -sSf -H 'Authorization: Bearer vm-test' http://127.0.0.1:8112"
 
               machine.wait_for_unit("bitcoind-regtest.service")
               machine.wait_for_unit("lnurl-mint.service")
@@ -176,7 +176,7 @@
 
               # the on-chain wallet follows bitcoind's blocks
               machine.succeed(f"{cli} createwallet miner")
-              address = machine.succeed(f"{admin}/node/address | sed 's/.*\"address\":\"\\([^\"]*\\)\".*/\\1/'").strip()
+              address = machine.succeed(f"{admin}/node/address -X POST | sed 's/.*\"address\":\"\\([^\"]*\\)\".*/\\1/'").strip()
               machine.succeed(f"{cli} generatetoaddress 101 $({cli} getnewaddress)")
               machine.succeed(f"{cli} -rpcwallet=miner sendtoaddress {address} 1")
               machine.succeed(f"{cli} generatetoaddress 1 $({cli} getnewaddress)")
