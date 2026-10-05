@@ -10,29 +10,52 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # formatting and lint for every language in the repo: Rust, the e2e tests'
+  # Python, and the admin UI's JavaScript/CSS
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      # lnurlcash-kernel compiles Bitcoin Core's kernel from source
+      # clippy compiles, and lnurlcash-kernel compiles Bitcoin Core's kernel
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake libboost-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      # the kernel build takes minutes; keep it between runs
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+
+      - uses: astral-sh/setup-uv@v7
+      - run: uvx ruff@0.16.10 check e2e
+      - run: uvx ruff@0.16.10 format --check e2e
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - run: npm ci --prefix e2e
+      - run: e2e/node_modules/.bin/biome ci
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake libboost-dev
+      - uses: dtolnay/rust-toolchain@stable
+      # the kernel build takes minutes; keep it between runs
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
   # real bitcoind, real LDK nodes, real payments: mint, melt, restarts,
-  # crashes, and lnurlcash-conformance's grader against the live mint
-  regtest:
+  # crashes; lnurlcash-conformance's grader against the live mint; and the
+  # admin web UI in a headless browser
+  e2e:
     runs-on: ubuntu-latest
     env:
       BITCOIN_VERSION: "31.1"
@@ -54,11 +77,27 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - run: python3 scripts/regtest_e2e.py
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - run: npm ci --prefix e2e
+      - run: npx --prefix e2e playwright install --with-deps chromium
+      - run: python3 e2e/regtest.py
         env:
           BITCOIN_BIN: bitcoin-${{ env.BITCOIN_VERSION }}/bin
           MINT_BIN: target/debug/lnurl-mint
           CONFORM: "1"
+          UI: "1"
+          UI_SCREENSHOTS: e2e-screenshots
+          KEEP: "1"
+      # the mints' logs and the UI's screenshots, when something fails
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-logs
+          path: |
+            /tmp/lnurl-mint-e2e-*
+            e2e-screenshots
+          if-no-files-found: ignore
 
   docker:
     runs-on: ubuntu-latest

@@ -102,12 +102,18 @@ opens as is (older column names are migrated on first open). See PLAN.md's
 
 ## Docker
 
+Released images are on Docker Hub as
+[`lnurlcash/lnurl-mint-rust`](https://hub.docker.com/r/lnurlcash/lnurl-mint-rust)
+(linux/amd64):
+
 ```sh
-docker build -t lnurl-mint .
-docker run -d --name lnurl-mint --network host \
-  -v lnurl-mint:/data --env-file .env \
-  lnurl-mint
+docker run -d --name lnurl-mint-rust --network host --stop-timeout 60 \
+  -v lnurl-mint-rust:/data --env-file .env \
+  lnurlcash/lnurl-mint-rust
 ```
+
+Or build it yourself with `make build` (`docker build -t lnurl-mint-rust .`);
+`make run` starts that local build the same way.
 
 The image runs as a non-root user (uid 1000) with `DATA_DIR=/data`: keep that
 volume, it holds the seed and the channels. `--network host` lets
@@ -192,10 +198,35 @@ user and password in an environment file.
 Every LNURL endpoint answers HTTP 200, with `{"status": "ERROR", "reason"}` on
 failure (LUD-01).
 
+### Admin UI
+
+With `ADMIN_TOKEN` set, open `ADMIN_LISTEN` (default
+`http://127.0.0.1:8112/`) in a browser and sign in with the token. The UI has
+five tabs:
+
+* **Overview:** node status, notes outstanding, and how much of them the
+  node's outbound liquidity covers.
+* **Channels:** open, close and force-close channels; connect peers.
+* **Payments:** create invoices to receive liquidity, and pay invoices.
+* **Wallet:** balances, receive addresses with QR codes, on-chain sends.
+* **Notes:** pending melts and reconcile, note lookup, registered usernames.
+
+Signing in trades the token for a session cookie (`HttpOnly`,
+`SameSite=Strict`, 12 hours), so the page's script never holds a credential.
+A change made with that cookie must come from the admin page's own origin.
+Sessions live in memory: a restart signs everyone out. The page loads
+nothing from outside the binary and is served under a strict
+Content-Security-Policy.
+
+The admin listens on loopback by default. To reach it from elsewhere, use an
+SSH tunnel (`ssh -L 8112:127.0.0.1:8112 host`) or a TLS reverse proxy. Behind
+a proxy that sets `X-Forwarded-Proto: https`, the cookie is also marked
+`Secure`.
+
 ### Admin API
 
-Served on `ADMIN_LISTEN` only when `ADMIN_TOKEN` is set, with every request
-carrying `Authorization: Bearer <ADMIN_TOKEN>`:
+Served on `ADMIN_LISTEN` only when `ADMIN_TOKEN` is set. Every request carries
+`Authorization: Bearer <ADMIN_TOKEN>`, or the UI's session cookie:
 
 | | |
 |---|---|
@@ -214,6 +245,30 @@ carrying `Authorization: Bearer <ADMIN_TOKEN>`:
 | `POST /node/pay` `{"bolt11", "max_fee_msat"}` | Pay from the node's liquidity. |
 | `GET /node/payment/<payment_hash>` | `complete`, `pending` or `absent`. |
 | `POST /node/send` `{"address", "amount_sat"}` | Send on-chain (everything, without `amount_sat`). |
+| `GET /qr?data=` | An SVG QR code, for the UI. |
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, then `make release`. That tags
+`v<version>` and pushes the tag, and `.github/workflows/release.yml` does the
+rest:
+* it checks that the tag matches `Cargo.toml`;
+* it builds the image and pushes `lnurlcash/lnurl-mint-rust` tagged
+  `X.Y.Z`, `X.Y`, `X` and `latest`;
+* it creates a GitHub release with generated notes.
+
+The repository needs the secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+(a Docker Hub access token, not the password), as in lnurl-mint.
+
+## Lint
+
+```sh
+make check    # rustfmt, clippy, ruff (e2e/*.py), biome (admin UI JS/CSS, e2e/*.mjs)
+make format   # apply all three formatters
+```
+
+Ruff runs through `uvx`. Biome, the conformance grader and Playwright are
+pinned in `e2e/package.json` (`npm ci --prefix e2e`).
 
 ## Tests
 
@@ -230,29 +285,38 @@ The money paths run end to end on regtest, with a real bitcoind and three
 mint processes (A under test, B paying and being paid, C unreachable):
 
 ```sh
-BITCOIN_BIN=/path/to/bitcoin-31.1/bin MINT_BIN=target/debug/lnurl-mint \
-    python3 scripts/regtest_e2e.py
+make e2e BITCOIN_BIN=/path/to/bitcoin-31.1/bin
+# which is: npm ci --prefix e2e; npx --prefix e2e playwright install chromium
+#           CONFORM=1 UI=1 MINT_BIN=target/debug/lnurl-mint python3 e2e/regtest.py
 ```
 
-The test covers channel opens from the BDK wallet, a real mint and its LUD-21
-proof, rotate, a real melt and its proof, a melt that can't be routed (refused,
-note kept), a restart with reconnection, a crash between reserving a melt's
-notes and sending it (released on start), and a SIGKILL mid-melt (note burned
-exactly when the payee was paid, funds swept back from the closed channel).
-CI runs it too.
+`e2e/regtest.py` covers:
+* channel opens funded from the BDK wallet;
+* a real mint and its LUD-21 proof, a rotate, a real melt and its proof;
+* a melt that can't be routed: refused, note kept;
+* a restart with reconnection;
+* a crash between reserving a melt's notes and sending it: the note is
+  released on start;
+* a SIGKILL mid-melt: the note burns exactly when the payee was paid, and a
+  force-closed channel's funds are swept back.
 
-With `CONFORM=1` the same run also grades mint A with
-[lnurlcash-conformance](https://www.npmjs.com/package/lnurlcash-conformance)'s
-`lnurlcash-conform` (pinned to 0.15.0, fetched with `npx`, so it needs node).
-It mints two fresh notes with real payments from B. On the first it runs the
-read-only checks plus the minted-value check. The second gets the full
-`--spend` run: rotate, split and merge, retries, refusals that must be atomic,
-script-path spends and time claims, and domain-bound key-path spends. CI runs
-this too. The grader never melts; the regtest test covers melts.
+Two optional steps:
 
-```sh
-CONFORM=1 BITCOIN_BIN=... MINT_BIN=target/debug/lnurl-mint python3 scripts/regtest_e2e.py
-```
+* **`CONFORM=1`:** grades A with
+  [lnurlcash-conformance](https://www.npmjs.com/package/lnurlcash-conformance)'s
+  grader. It mints two fresh notes with real payments from B. On the first it
+  runs the read-only checks plus the minted-value check. The second gets the
+  full `--spend` run: rotate, split and merge, retries, refusals that must be
+  atomic, script-path spends and time claims, and domain-bound key-path
+  spends. Current result: 49 checks pass. The one warning is the optional
+  `/stats` endpoint, which is outside LUD-25. The grader never melts; the
+  regtest test covers melts.
+* **`UI=1`:** runs `e2e/admin_ui.mjs`, the admin UI in headless Chromium
+  against A. It checks a wrong token and the login, every tab with live data,
+  an invoice and an address with their QR codes, the session surviving a
+  reload, every tab at phone width, and logout. Any console error other than
+  the expected 401s fails it, CSP violations included.
+  `UI_SCREENSHOTS=<dir>` keeps its screenshots.
 
-Current result: 49 checks pass. The one warning is the optional `/stats`
-endpoint, which is outside LUD-25.
+CI runs all of it in four jobs: lint, test, e2e and docker, plus `nix flake
+check`. When the e2e job fails it uploads the mints' logs and the screenshots.

@@ -37,8 +37,8 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          # cargo and the kernel's C++ build; bitcoind and python for the
-          # regtest end-to-end test (scripts/regtest_e2e.py)
+          # cargo and the kernel's C++ build; bitcoind, python, node and ruff
+          # for the end-to-end tests and lint (e2e/, `make check`)
           default = pkgs.mkShell {
             inputsFrom = [ self.packages.${system}.lnurl-mint ];
             packages = [
@@ -49,6 +49,7 @@
               pkgs.bitcoind
               pkgs.python3
               pkgs.nodejs
+              pkgs.ruff
             ];
             LNURLCASHKERNEL_BOOST_DIR = "${pkgs.boost.dev}/lib/cmake/Boost-${pkgs.boost.version}";
           };

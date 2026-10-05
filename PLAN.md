@@ -199,7 +199,7 @@ an older lnurl-mint database failed to open, and lnurl-mint's column renames
 were missing.
 
 **Phase 2 is done, and phase 3 mostly** (2026-10-02), proven end to end on
-regtest by `scripts/regtest_e2e.py` (also run in CI). Done: the node (LDK 0.2.6,
+regtest by `e2e/regtest.py` (also run in CI). Done: the node (LDK 0.2.6,
 following ldk-sample), the BDK wallet fed from the same block stream, anchor
 fee bumps, the sweeper, the event handler, event-driven mint and melt,
 startup/periodic reconcile, `cs1` from the node key, node info, and the admin
@@ -239,7 +239,19 @@ node operations. Decisions taken on the way:
   KVM); CI runs it on GitHub's runners.
 - **Conformance.** `lnurlcash-conformance` 0.15.0's grader runs against a live
   regtest mint (`CONFORM=1` in the regtest test, and in CI): 49 checks pass,
-  with one warning for the optional `/stats` endpoint. Phase 4's
+  with one warning for the optional `/stats` endpoint.
+- **Admin UI and release** (2026-10-03). A web UI on the admin port, with a
+  token login that issues an in-memory session cookie, tested in headless
+  Chromium by `e2e/admin_ui.mjs` (`UI=1`, and in CI). A release workflow
+  pushes `lnurlcash/lnurl-mint-rust` to Docker Hub on a `v*` tag, as
+  lnurl-mint does. Lint covers all three languages (rustfmt/clippy, Ruff,
+  Biome).
+- **Open: the 10% in-flight limit.** LDK accepts at most 10% of an inbound
+  channel's capacity in flight by default
+  (`max_inbound_htlc_value_in_flight_percent_of_channel`). A mint therefore
+  can't receive a single payment above 10% of its largest inbound channel,
+  which caps the notes it can mint. Raising it means more value at risk per
+  HTLC; decide and make it a setting. Phase 4's
 `test_poc_*` ports are partly covered by the store and HTTP tests and the
 regtest test; the rest are still to port.
 

@@ -1,0 +1,15 @@
+{
+  "name": "lnurl-mint-rust-e2e",
+  "private": true,
+  "description": "End-to-end tests for lnurl-mint-rust: the admin UI in a browser, the conformance grader, and lint for the JavaScript",
+  "type": "module",
+  "scripts": {
+    "lint": "cd .. && biome check",
+    "admin-ui": "node admin_ui.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "lnurlcash-conformance": "0.15.0",
+    "playwright": "1.63.0"
+  }
+}

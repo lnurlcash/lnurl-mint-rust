@@ -293,7 +293,11 @@ async fn send(State(state): State<AppState>, Json(req): Json<Send>) -> AdminResu
 
 #[cfg(test)]
 mod tests {
-    use axum::body::Body;
+    use axum::{
+        body::Body,
+        http::{Request, Response, header},
+    };
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     use super::*;
@@ -302,6 +306,8 @@ mod tests {
         ln::{Ln, Network},
         state::test_settings,
     };
+
+    const HOST: &str = "127.0.0.1:8112";
 
     fn app() -> Router {
         let state = AppState::new(
@@ -312,15 +318,33 @@ mod tests {
         router(state, "s3cret".into())
     }
 
+    async fn send(app: &Router, req: Request<Body>) -> Response<Body> {
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    fn get(path: &str) -> axum::http::request::Builder {
+        Request::builder().uri(path).header(header::HOST, HOST)
+    }
+
+    fn post(path: &str, origin: Option<&str>) -> axum::http::request::Builder {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, HOST)
+            .header(header::CONTENT_TYPE, "application/json");
+        match origin {
+            Some(origin) => req.header(header::ORIGIN, origin),
+            None => req,
+        }
+    }
+
     async fn status(auth: Option<&str>) -> StatusCode {
-        let mut req = Request::builder().uri("/pending");
+        let mut req = get("/pending");
         if let Some(auth) = auth {
             req = req.header(header::AUTHORIZATION, auth);
         }
-        app()
-            .oneshot(req.body(Body::empty()).unwrap())
+        send(&app(), req.body(Body::empty()).unwrap())
             .await
-            .unwrap()
             .status()
     }
 
@@ -330,5 +354,144 @@ mod tests {
         assert_eq!(status(Some("Bearer nope")).await, StatusCode::UNAUTHORIZED);
         assert_eq!(status(Some("s3cret")).await, StatusCode::UNAUTHORIZED);
         assert_eq!(status(Some("Bearer s3cret")).await, StatusCode::OK);
+    }
+
+    /// Log in from the page's own origin; the session cookie it sets.
+    async fn login(app: &Router, token: &str) -> Result<String, StatusCode> {
+        let res = send(
+            app,
+            post("/login", Some("http://127.0.0.1:8112"))
+                .body(Body::from(format!(r#"{{"token":"{token}"}}"#)))
+                .unwrap(),
+        )
+        .await;
+        if res.status() != StatusCode::OK {
+            return Err(res.status());
+        }
+        let cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+        Ok(cookie.split(';').next().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn a_session_from_the_login_works_like_the_token() {
+        let app = app();
+        assert_eq!(login(&app, "nope").await, Err(StatusCode::UNAUTHORIZED));
+        let cookie = login(&app, "s3cret").await.unwrap();
+
+        let res = send(
+            &app,
+            get("/pending")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        // a cookie that was never issued opens nothing
+        let forged = get("/pending")
+            .header(header::COOKIE, "mint_admin=00")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, forged).await.status(), StatusCode::UNAUTHORIZED);
+
+        // a change needs the page's own origin
+        let reconcile = |origin| {
+            post("/reconcile", origin)
+                .header(header::COOKIE, &cookie)
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        assert_eq!(
+            send(&app, reconcile(Some("http://127.0.0.1:8112")))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&app, reconcile(Some("https://evil.example")))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&app, reconcile(None)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // logging out ends the session
+        let out = post("/logout", Some("http://127.0.0.1:8112"))
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert!(
+            send(&app, out).await.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        let res = send(
+            &app,
+            get("/pending")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_login_from_another_origin_is_refused() {
+        let res = send(
+            &app(),
+            post("/login", Some("https://evil.example"))
+                .body(Body::from(r#"{"token":"s3cret"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_page_is_public_and_locked_down() {
+        let app = app();
+        for (path, kind) in [
+            ("/", "text/html"),
+            ("/admin.js", "text/javascript"),
+            ("/admin.css", "text/css"),
+        ] {
+            let res = send(&app, get(path).body(Body::empty()).unwrap()).await;
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            let headers = res.headers();
+            assert!(
+                headers[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with(kind)
+            );
+            let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+            assert!(csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"));
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        }
+        // the API behind it is not
+        let res = send(&app, get("/info").body(Body::empty()).unwrap()).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // and QR codes need a session too
+        let res = send(&app, get("/qr?data=bc1q").body(Body::empty()).unwrap()).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn qr_codes_are_svg() {
+        let req = get("/qr?data=bitcoin%3Abcrt1qtest")
+            .header(header::AUTHORIZATION, "Bearer s3cret")
+            .body(Body::empty())
+            .unwrap();
+        let res = send(&app(), req).await;
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"<?xml") || body.windows(4).any(|w| w == b"<svg"));
     }
 }

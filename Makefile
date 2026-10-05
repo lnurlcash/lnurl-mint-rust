@@ -6,24 +6,41 @@ VOLUME_NAME = lnurl-mint-rust
 
 all: format lint
 
-format:
+# every language in the repo: Rust, the e2e tests' Python, the admin UI's JS
+# and CSS. Ruff runs through uvx; Biome is pinned in e2e/package.json.
+RUFF = uvx ruff@0.16.10
+BIOME = e2e/node_modules/.bin/biome
+
+format: e2e/node_modules
 	cargo fmt
+	$(RUFF) format e2e
+	$(BIOME) check --write
 
-lint:
+lint: e2e/node_modules
 	cargo clippy --all-targets -- -D warnings
+	$(RUFF) check e2e
+	$(BIOME) lint
 
-check:
+check: e2e/node_modules
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
+	$(RUFF) check e2e
+	$(RUFF) format --check e2e
+	$(BIOME) ci
 
 test:
 	cargo test
 
-# the regtest end-to-end test, plus the conformance grader; needs
-# BITCOIN_BIN=/path/to/bitcoin/bin
-e2e:
+e2e/node_modules: e2e/package.json e2e/package-lock.json
+	npm ci --prefix e2e
+	touch $@
+
+# the regtest end-to-end test with the conformance grader and the admin UI in
+# a headless browser; needs BITCOIN_BIN=/path/to/bitcoin/bin
+e2e: e2e/node_modules
 	cargo build
-	CONFORM=1 MINT_BIN=target/debug/lnurl-mint python3 scripts/regtest_e2e.py
+	npx --prefix e2e playwright install chromium
+	CONFORM=1 UI=1 MINT_BIN=target/debug/lnurl-mint python3 e2e/regtest.py
 
 build:
 	docker build --pull -t $(IMAGE_NAME) .

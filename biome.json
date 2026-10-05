@@ -1,0 +1,26 @@
+{
+  "$schema": "./e2e/node_modules/@biomejs/biome/configuration_schema.json",
+  "files": {
+    "includes": ["src/admin_ui/**/*.js", "src/admin_ui/**/*.css", "e2e/*.mjs", "!!**/target", "!!**/node_modules"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 130
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "bracketSpacing": false,
+      "arrowParentheses": "always",
+      "trailingCommas": "all"
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended"
+    }
+  }
+}

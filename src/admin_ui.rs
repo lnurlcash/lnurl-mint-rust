@@ -100,7 +100,10 @@ fn same_origin(headers: &HeaderMap) -> bool {
     let origin = headers.get(header::ORIGIN).and_then(|h| h.to_str().ok());
     match (origin, host) {
         (Some(origin), Some(host)) => {
-            origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")) == Some(host)
+            origin
+                .strip_prefix("http://")
+                .or_else(|| origin.strip_prefix("https://"))
+                == Some(host)
         }
         _ => false,
     }
@@ -143,7 +146,11 @@ pub async fn login(
     }
     if !auth.token_matches(body.token.trim()) {
         tokio::time::sleep(FAILED_LOGIN_DELAY).await;
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "wrong token"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "wrong token"})),
+        )
+            .into_response();
     }
     let id = auth.new_session();
     // Secure once a TLS proxy says the browser came over https; the admin
@@ -178,7 +185,11 @@ pub async fn logout(State(auth): State<Arc<Auth>>, headers: HeaderMap) -> Respon
 }
 
 pub async fn index() -> Response {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX_HTML).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
+        .into_response()
 }
 
 pub async fn script() -> Response {
@@ -190,7 +201,11 @@ pub async fn script() -> Response {
 }
 
 pub async fn stylesheet() -> Response {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], ADMIN_CSS).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        ADMIN_CSS,
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -219,9 +234,18 @@ pub async fn qr(Query(q): Query<QrQuery>) -> Response {
 pub async fn security_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     res

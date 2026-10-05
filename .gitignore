@@ -5,3 +5,4 @@
 *.sqlite3-shm
 .env
 /result
+__pycache__/

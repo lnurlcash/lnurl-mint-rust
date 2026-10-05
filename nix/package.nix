@@ -30,7 +30,7 @@ rustPlatform.buildRustPackage {
 
   # the checkPhase runs the whole cargo test suite: LUD-25/26 vectors against
   # Bitcoin Core's interpreter, the store, and the protocol over HTTP. The
-  # regtest end-to-end test needs bitcoind and is CI's (scripts/).
+  # regtest end-to-end test needs bitcoind and is CI's (e2e/).
   doCheck = true;
 
   meta = {

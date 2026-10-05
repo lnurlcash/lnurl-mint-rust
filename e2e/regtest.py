@@ -12,8 +12,14 @@ Only the public LNURL endpoints and the admin API are used, the way a wallet
 and an operator would. Needs bitcoind/bitcoin-cli (BITCOIN_BIN, a directory)
 and a built lnurl-mint (MINT_BIN). Everything lives in a temporary directory.
 
+Optional, with `npm ci --prefix e2e` first:
+
+- CONFORM=1 grades A with lnurlcash-conformance's grader
+- UI=1 drives the admin web UI in a headless browser (needs `npx --prefix e2e
+  playwright install chromium`); UI_SCREENSHOTS=<dir> keeps its screenshots
+
     BITCOIN_BIN=/path/to/bitcoin/bin MINT_BIN=target/debug/lnurl-mint \\
-        python3 scripts/regtest_e2e.py
+        python3 e2e/regtest.py
 """
 
 import hashlib
@@ -155,7 +161,9 @@ def fund(mint: Mint, btc: str) -> None:
     cli("-rpcwallet=miner", "sendtoaddress", address, btc)
 
 
-CONFORMANCE = os.environ.get("CONFORMANCE_PKG", "lnurlcash-conformance@0.15.0")
+HERE = os.path.dirname(os.path.abspath(__file__))
+# e2e/package.json pins the grader and the browser driver: `npm ci --prefix e2e`
+NODE_BIN = os.path.join(HERE, "node_modules", ".bin")
 
 
 def mint_note(a: "Mint", b: "Mint", seed: int, amount_msat: int) -> str:
@@ -171,7 +179,7 @@ def conformance(a: "Mint", b: "Mint") -> None:
     """lnurlcash-conformance's grader against A: read-only, the paid-value
     check on a fresh note, then the full mutating run on another."""
     pay_url = f"{a.base}/.well-known/lnurlp/mint"
-    grader = ["npx", "-y", "-p", CONFORMANCE, "lnurlcash-conform", pay_url]
+    grader = [os.path.join(NODE_BIN, "lnurlcash-conform"), pay_url]
     fresh = mint_note(a, b, 101, 60_000)
     spendable = mint_note(a, b, 102, 60_000)
     for name, extra in [
@@ -184,6 +192,21 @@ def conformance(a: "Mint", b: "Mint") -> None:
         print(run.stdout + run.stderr, flush=True)
         assert run.returncode == 0, f"conformance ({name}) failed"
         log(f"conformance ({name}): passed")
+
+
+def admin_ui(a: "Mint") -> None:
+    """The admin web UI in a headless browser, against A (e2e/admin_ui.mjs)."""
+    shots = os.environ.get("UI_SCREENSHOTS") or None
+    run = subprocess.run(
+        ["node", os.path.join(HERE, "admin_ui.mjs"), f"http://127.0.0.1:{a.admin}/", TOKEN]
+        + ([shots] if shots else []),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    print(run.stdout + run.stderr, flush=True)
+    assert run.returncode == 0, "admin UI test failed"
+    log("admin UI: passed")
 
 
 def main() -> None:
@@ -244,6 +267,9 @@ def main() -> None:
     assert note["mintPubkey"] == a.node_id() and note["c"].startswith("cs990n1"), note
     log("minted 99000 msat (100000 paid, 1000 fee), certificate signed by the node key")
 
+    if os.environ.get("UI"):
+        admin_ui(a)
+
     # ---- rotate into a fresh note, then melt it to B ----
     k1b, hb = bearer_note(2)
     assert a.get(f"/w/cb?k1={k1}&p1={hb}")["status"] == "OK"
@@ -252,7 +278,10 @@ def main() -> None:
     assert melt["status"] == "OK", melt
     wait_for(lambda: a.get(f"/w?k1={k1b}").get("reason") == "Note already spent.", "note burned")
     verify = a.get(melt["verify"].removeprefix(a.base))
-    assert verify["settled"] is True and hashlib.sha256(bytes.fromhex(verify["preimage"])).hexdigest() == out["payment_hash"], verify
+    assert (
+        verify["settled"] is True
+        and hashlib.sha256(bytes.fromhex(verify["preimage"])).hexdigest() == out["payment_hash"]
+    ), verify
     assert a.admin_get("/pending")["pending_melts"] == {}
     log("melted 99000 msat to B, burned once settled, preimage proves it")
 
@@ -317,6 +346,7 @@ def main() -> None:
 
     # a force-closed channel's funds come back to the on-chain wallet
     if a.usable() < 2:
+
         def swept() -> bool:
             mine(10)
             return a.admin_get("/node/balance")["onchain"]["confirmed_sat"] > onchain_before
@@ -328,13 +358,20 @@ def main() -> None:
     log("PASS")
 
 
+def _exit_on_sigterm(*_) -> None:
+    # SIGTERM would otherwise end the interpreter without the cleanup below,
+    # leaving bitcoind and the mints running
+    sys.exit(143)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     ok = False
     try:
         main()
         ok = True
     finally:
-        for name, proc in reversed(list(procs.items())):
+        for proc in reversed(list(procs.values())):
             proc.send_signal(signal.SIGTERM)
         for proc in procs.values():
             try:
