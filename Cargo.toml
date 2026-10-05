@@ -1,6 +1,7 @@
 [package]
 name = "lnurl-mint"
-version = "0.1.0"
+# placeholder: release.yml stamps the version from the git tag at release time
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.87.0"
 description = "LNURLcash mint (LUD-25 bearer notes, LUD-26 derivation and Lightning Address) that is its own Lightning node, on LDK and BDK"

@@ -73,6 +73,7 @@ async fn info(State(state): State<AppState>) -> AdminResult {
     let s = &state.settings;
     let (base, host) = s.public_base_url_and_host(None);
     Ok(Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "base_url": base,
         "onion_url": s.onion_url,
         "lightning_address": format!("{}@{host}", s.username),

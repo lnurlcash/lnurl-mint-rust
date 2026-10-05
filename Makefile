@@ -61,8 +61,8 @@ run:
 		$(IMAGE_NAME)
 	@echo "Container $(CONTAINER_NAME) is running"
 
-# tags the Cargo.toml version and pushes the tag: CI's release workflow
-# builds and pushes lnurlcash/lnurl-mint-rust to Docker Hub from it
+# tags v$(VERSION) and pushes the tag: CI's release workflow stamps that
+# version into the build and pushes lnurlcash/lnurl-mint-rust to Docker Hub
 release:
-	@version=$$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
-	git tag "v$$version" && git push origin "v$$version"
+	@test -n "$(VERSION)" || { echo "usage: make release VERSION=x.y.z"; exit 1; }
+	git tag "v$(VERSION)" && git push origin "v$(VERSION)"

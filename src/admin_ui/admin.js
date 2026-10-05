@@ -223,6 +223,7 @@ async function overview() {
             info.base_fee_msat || info.fee_percent_ppm ? `${sat(info.base_fee_msat)} + ${info.fee_percent_ppm} ppm` : 'none',
           ],
           ['Mintable', `${sat(info.min_sendable_msat)} – ${sat(info.max_sendable_msat)}`],
+          ['Version', info.version],
           info.sunset_mint ? ['Sunset', h('span', {class: 'warn'}, 'minting and splitting refused')] : null,
         ]),
       ),

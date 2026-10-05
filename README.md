@@ -249,13 +249,20 @@ Served on `ADMIN_LISTEN` only when `ADMIN_TOKEN` is set. Every request carries
 
 ## Releasing
 
-Bump `version` in `Cargo.toml`, commit, then `make release`. That tags
-`v<version>` and pushes the tag, and `.github/workflows/release.yml` does the
-rest:
-* it checks that the tag matches `Cargo.toml`;
-* it builds the image and pushes `lnurlcash/lnurl-mint-rust` tagged
-  `X.Y.Z`, `X.Y`, `X` and `latest`;
-* it creates a GitHub release with generated notes.
+The git tag is the version. `Cargo.toml` carries a `0.0.0` placeholder, as
+lnurlcash-core does, and local builds report it. To release:
+
+```sh
+make release VERSION=0.1.0    # tags v0.1.0 and pushes the tag
+```
+
+`.github/workflows/release.yml` then:
+* stamps `0.1.0` into `Cargo.toml` and `Cargo.lock`, refusing a tag that isn't
+  `vMAJOR.MINOR.PATCH`;
+* builds the image, whose `lnurl-mint --version`, admin `/info` and admin UI
+  report that version;
+* pushes `lnurlcash/lnurl-mint-rust` tagged `X.Y.Z`, `X.Y`, `X` and `latest`;
+* creates a GitHub release with generated notes.
 
 The repository needs the secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
 (a Docker Hub access token, not the password), as in lnurl-mint.
