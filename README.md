@@ -113,7 +113,19 @@ docker run -d --name lnurl-mint-rust --network host --stop-timeout 60 \
 ```
 
 Or build it yourself with `make build` (`docker build -t lnurl-mint-rust .`);
-`make run` starts that local build the same way.
+`make run` starts that local build the same way, with `.env`. It also mounts
+bitcoind's RPC cookie:
+* The default is `~/.bitcoin/.cookie`; override it with
+  `make run BITCOIN_COOKIE=/var/lib/bitcoind/.cookie`.
+* The cookie's directory is mounted read-only at `/bitcoin`, and
+  `BITCOIND_RPC_COOKIE` points there.
+* The directory is mounted rather than the file because bitcoind writes a new
+  cookie on each restart, and a single-file mount would keep the old one.
+* The container runs as uid 1000 and gets the cookie's group: give bitcoind
+  `rpccookieperms=group` unless the cookie is already readable by uid 1000.
+
+The mint reads the cookie when it starts. After bitcoind restarts, restart
+the mint too (`docker restart -t 60 lnurl-mint-rust`).
 
 The image runs as a non-root user (uid 1000) with `DATA_DIR=/data`: keep that
 volume, it holds the seed and the channels. `--network host` lets

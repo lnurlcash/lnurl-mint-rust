@@ -51,9 +51,7 @@ use lightning::{
     },
 };
 use lightning_background_processor::{GossipSync, NO_LIQUIDITY_MANAGER, process_events_async};
-use lightning_block_sync::{
-    SpvClient, UnboundedCache, gossip::TokioSpawner, init, poll, rpc::RpcClient,
-};
+use lightning_block_sync::{SpvClient, UnboundedCache, gossip::TokioSpawner, init, poll};
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use tokio::{sync::watch, task::JoinHandle};
@@ -91,7 +89,7 @@ pub(super) type ChannelManager =
 pub(super) type NetworkGraph = gossip::NetworkGraph<Arc<LdkLogger>>;
 
 type GossipVerifier =
-    lightning_block_sync::gossip::GossipVerifier<TokioSpawner, Arc<RpcClient>, Arc<LdkLogger>>;
+    lightning_block_sync::gossip::GossipVerifier<TokioSpawner, Arc<Bitcoind>, Arc<LdkLogger>>;
 
 type P2pGossip = P2PGossipSync<Arc<NetworkGraph>, Arc<GossipVerifier>, Arc<LdkLogger>>;
 
@@ -462,7 +460,7 @@ impl Node {
             Arc::clone(&keys_manager),
         ));
         gossip_sync.add_utxo_lookup(Some(Arc::new(GossipVerifier::new(
-            Arc::clone(&bitcoind.rpc),
+            Arc::clone(&bitcoind),
             TokioSpawner,
             Arc::clone(&gossip_sync),
             Arc::clone(&peer_manager),

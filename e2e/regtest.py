@@ -81,8 +81,11 @@ def http(method: str, url: str, body: dict | None = None) -> dict:
 
 
 class Mint:
-    def __init__(self, name: str, n: int):
+    def __init__(self, name: str, n: int, rpc_port: int = RPC_PORT, cookie: str | None = None):
         self.name = name
+        self.rpc_port = rpc_port
+        # bitcoind's cookie file instead of the shared user and password
+        self.cookie = cookie
         self.http = 18100 + n * 10
         self.admin = self.http + 1
         self.ln = 19700 + n
@@ -98,12 +101,14 @@ class Mint:
             LISTEN=f"127.0.0.1:{self.http}",
             ADMIN_LISTEN=f"127.0.0.1:{self.admin}",
             ADMIN_TOKEN=TOKEN,
-            BITCOIND_RPC=f"127.0.0.1:{RPC_PORT}",
-            BITCOIND_RPC_USER="u",
-            BITCOIND_RPC_PASSWORD="p",
+            BITCOIND_RPC=f"127.0.0.1:{self.rpc_port}",
             LN_LISTEN=f"127.0.0.1:{self.ln}",
             RUST_LOG=os.environ.get("E2E_RUST_LOG", "info,ldk=warn"),
         )
+        if self.cookie:
+            env["BITCOIND_RPC_COOKIE"] = self.cookie
+        else:
+            env.update(BITCOIND_RPC_USER="u", BITCOIND_RPC_PASSWORD="p")
         out = open(f"{work}/{self.name}.log", "a")
         procs[self.name] = subprocess.Popen([MINT_BIN], env=env, stdout=out, stderr=out, cwd=work)
         wait_for(lambda: self.info()["lightning"] == "ready", f"{self.name} up")
@@ -207,6 +212,69 @@ def admin_ui(a: "Mint") -> None:
     print(run.stdout + run.stderr, flush=True)
     assert run.returncode == 0, "admin UI test failed"
     log("admin UI: passed")
+
+
+COOKIE_RPC_PORT = 18643
+
+
+def cookie_renewal() -> None:
+    """bitcoind restarts, and writes a new cookie, under a running mint that
+    authenticates by cookie: the mint keeps syncing without a restart."""
+    datadir = f"{work}/bitcoind-cookie"
+    os.makedirs(datadir)
+
+    def start_bitcoind() -> None:
+        procs["bitcoind-cookie"] = subprocess.Popen(
+            [
+                f"{BITCOIN_BIN}/bitcoind",
+                "-regtest",
+                f"-datadir={datadir}",
+                f"-rpcport={COOKIE_RPC_PORT}",
+                "-fallbackfee=0.0002",
+                "-listen=0",
+            ],
+            stdout=subprocess.DEVNULL,
+        )
+        wait_for(lambda: cookie_cli("getblockcount") is not None, "cookie bitcoind")
+
+    def cookie_cli(*args: str) -> str:
+        return subprocess.check_output(
+            [
+                f"{BITCOIN_BIN}/bitcoin-cli",
+                "-regtest",
+                f"-datadir={datadir}",
+                f"-rpcport={COOKIE_RPC_PORT}",
+                *args,
+            ],
+            text=True,
+        ).strip()
+
+    def cookie_mine(n: int) -> None:
+        cookie_cli("generatetoaddress", str(n), cookie_cli("-rpcwallet=miner", "getnewaddress"))
+
+    start_bitcoind()
+    cookie_cli("createwallet", "miner")
+    cookie_mine(101)
+    cookie = f"{datadir}/regtest/.cookie"
+    d = Mint("d", 4, rpc_port=COOKIE_RPC_PORT, cookie=cookie)
+    d.start()
+    address = d.admin_post("/node/address")["address"]
+    cookie_cli("-rpcwallet=miner", "sendtoaddress", address, "1")
+
+    before = open(cookie).read()
+    procs.pop("bitcoind-cookie").send_signal(signal.SIGTERM)
+    wait_for(lambda: not os.path.exists(cookie), "cookie bitcoind stopped")
+    start_bitcoind()
+    assert open(cookie).read() != before, "bitcoind wrote the same cookie"
+    cookie_cli("loadwallet", "miner")
+    cookie_mine(1)
+    wait_for(
+        lambda: d.admin_get("/node/balance")["onchain"]["confirmed_sat"] == 100_000_000,
+        "the new block, synced with the new cookie",
+    )
+    assert "d" in procs and procs["d"].poll() is None, "the mint was restarted"
+    log("bitcoind restarted with a new cookie: the running mint renewed it and kept syncing")
+    d.stop()
 
 
 def main() -> None:
@@ -354,6 +422,8 @@ def main() -> None:
         wait_for(swept, "closed channel swept back to the wallet", 300)
         log("the closed channel's balance was swept back into A's on-chain wallet")
     assert stats["spent_notes"] == spent_before + spent, stats
+
+    cookie_renewal()
 
     log("PASS")
 
