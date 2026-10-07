@@ -37,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("could not create {}", config.data_dir.display()))?;
+    // first, before the database or the node: a second mint on this data
+    // directory stops here, without touching either
+    let socket_path = config.admin_socket();
+    let admin_socket = admin::bind_socket(&socket_path)?;
     let database_path = config.database_path();
     let store = db::NoteStore::open(&database_path.to_string_lossy()).map_err(|e| {
         let dir = database_path.parent().unwrap_or(&config.data_dir);
@@ -75,11 +79,20 @@ async fn main() -> anyhow::Result<()> {
             .into_future(),
     );
 
+    // lnurl-mint-cli's way in, always: the API on a socket only this user opens
+    log::info!("admin socket at {}", socket_path.display());
+    let socket_router = admin::api(state.clone());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(admin_socket, socket_router.into_make_service()).await {
+            log::error!("admin socket stopped: {e}");
+        }
+    });
+
     if let Some(token) = config.admin_token.clone() {
         let listener = tokio::net::TcpListener::bind(config.admin_listen)
             .await
             .with_context(|| format!("could not listen on {}", config.admin_listen))?;
-        log::info!("admin API on {}", config.admin_listen);
+        log::info!("admin API and web UI on {}", config.admin_listen);
         let router = admin::router(state.clone(), token);
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router.into_make_service()).await {
@@ -87,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     } else {
-        log::info!("admin API off: set ADMIN_TOKEN to serve it");
+        log::info!("admin HTTP API and web UI off: set ADMIN_TOKEN to serve them");
     }
 
     let reconciler_state = state.clone();
@@ -104,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
     server.await.context("server task panicked")??;
     state.ln.stop().await;
+    let _ = std::fs::remove_file(&socket_path);
     log::info!("shut down");
     Ok(())
 }

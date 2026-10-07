@@ -81,8 +81,17 @@ def http(method: str, url: str, body: dict | None = None) -> dict:
 
 
 class Mint:
-    def __init__(self, name: str, n: int, rpc_port: int = RPC_PORT, cookie: str | None = None):
+    def __init__(
+        self,
+        name: str,
+        n: int,
+        rpc_port: int = RPC_PORT,
+        cookie: str | None = None,
+        http_admin: bool = True,
+    ):
         self.name = name
+        # without it the admin HTTP API is off, and only the CLI's socket is there
+        self.http_admin = http_admin
         self.rpc_port = rpc_port
         # bitcoind's cookie file instead of the shared user and password
         self.cookie = cookie
@@ -100,11 +109,12 @@ class Mint:
             DATA_DIR=self.dir,
             LISTEN=f"127.0.0.1:{self.http}",
             ADMIN_LISTEN=f"127.0.0.1:{self.admin}",
-            ADMIN_TOKEN=TOKEN,
             BITCOIND_RPC=f"127.0.0.1:{self.rpc_port}",
             LN_LISTEN=f"127.0.0.1:{self.ln}",
             RUST_LOG=os.environ.get("E2E_RUST_LOG", "info,ldk=warn"),
         )
+        if self.http_admin:
+            env["ADMIN_TOKEN"] = TOKEN
         if self.cookie:
             env["BITCOIND_RPC_COOKIE"] = self.cookie
         else:
@@ -112,6 +122,12 @@ class Mint:
         out = open(f"{work}/{self.name}.log", "a")
         procs[self.name] = subprocess.Popen([MINT_BIN], env=env, stdout=out, stderr=out, cwd=work)
         wait_for(lambda: self.info()["lightning"] == "ready", f"{self.name} up")
+
+    def cli(self, *args: str) -> dict:
+        """lnurl-mint-cli over this mint's admin socket."""
+        res = run_cli(self, *args)
+        assert res.returncode == 0, f"lnurl-mint-cli {' '.join(args)}: {res.stderr}"
+        return json.loads(res.stdout)
 
     def stop(self) -> None:
         proc = procs.pop(self.name)
@@ -129,8 +145,8 @@ class Mint:
 
     def info(self) -> dict:
         try:
-            return self.admin_get("/info")
-        except (OSError, RuntimeError):
+            return self.admin_get("/info") if self.http_admin else self.cli("info")
+        except (OSError, RuntimeError, AssertionError):
             return {"lightning": "down"}
 
     def node_id(self) -> str:
@@ -199,6 +215,43 @@ def conformance(a: "Mint", b: "Mint") -> None:
         log(f"conformance ({name}): passed")
 
 
+CLI_BIN = os.path.join(os.path.dirname(MINT_BIN), "lnurl-mint-cli")
+
+
+def run_cli(mint: "Mint", *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """lnurl-mint-cli with `mint`'s DATA_DIR: its admin socket, unless `env` says otherwise.
+    No admin setting leaks in from the calling environment."""
+    clean = {"ADMIN_TOKEN", "LNURL_MINT_ADMIN", "ADMIN_SOCKET", "DATA_DIR"}
+    full = {k: v for k, v in os.environ.items() if k not in clean}
+    full["DATA_DIR"] = mint.dir
+    full.update(env or {})
+    return subprocess.run([CLI_BIN, *args], env=full, capture_output=True, text=True, timeout=60)
+
+
+def mint_cli(a: "Mint") -> None:
+    """lnurl-mint-cli against A: over the admin socket, and over HTTP with the token."""
+    info = a.cli("info")
+    assert info["lightning"] == "ready" and info["mint_pubkey"] == a.node_id(), info
+    assert a.cli("balance")["onchain"]["confirmed_sat"] > 0
+    assert len(a.cli("channels")) >= 1
+    assert a.cli("address")["address"].startswith("bcrt1p")
+    invoice = a.cli("invoice", "1234", "from the cli")
+    assert invoice["bolt11"].startswith("lnbcrt12340n"), invoice
+    assert a.cli("invoice-status", invoice["payment_hash"]) == {"paid": False}
+    assert a.cli("pending") == {"pending_melts": {}}
+
+    http = {"LNURL_MINT_ADMIN": f"127.0.0.1:{a.admin}", "ADMIN_TOKEN": TOKEN}
+    res = run_cli(a, "info", env=http)
+    assert res.returncode == 0 and json.loads(res.stdout)["mint_pubkey"] == a.node_id(), res
+    refused = run_cli(a, "info", env={**http, "ADMIN_TOKEN": "wrong"})
+    assert refused.returncode != 0 and "refused the admin token" in refused.stderr, refused
+    nowhere = run_cli(a, "info", env={"DATA_DIR": f"{work}/nowhere"})
+    assert nowhere.returncode != 0 and "no admin socket" in nowhere.stderr, nowhere
+    bad = run_cli(a, "send", "bcrt1qnothing")
+    assert bad.returncode != 0 and "--all" in bad.stderr, bad
+    log("lnurl-mint-cli: socket and HTTP; wrong token, missing socket and bad arguments refused")
+
+
 def admin_ui(a: "Mint") -> None:
     """The admin web UI in a headless browser, against A (e2e/admin_ui.mjs)."""
     shots = os.environ.get("UI_SCREENSHOTS") or None
@@ -256,9 +309,15 @@ def cookie_renewal() -> None:
     cookie_cli("createwallet", "miner")
     cookie_mine(101)
     cookie = f"{datadir}/regtest/.cookie"
-    d = Mint("d", 4, rpc_port=COOKIE_RPC_PORT, cookie=cookie)
+    # admin HTTP off: everything below goes through lnurl-mint-cli's socket
+    d = Mint("d", 4, rpc_port=COOKIE_RPC_PORT, cookie=cookie, http_admin=False)
     d.start()
-    address = d.admin_post("/node/address")["address"]
+    try:
+        d.admin_get("/info")
+        raise AssertionError("the admin HTTP API answered without ADMIN_TOKEN")
+    except OSError:
+        pass
+    address = d.cli("address")["address"]
     cookie_cli("-rpcwallet=miner", "sendtoaddress", address, "1")
 
     before = open(cookie).read()
@@ -269,11 +328,14 @@ def cookie_renewal() -> None:
     cookie_cli("loadwallet", "miner")
     cookie_mine(1)
     wait_for(
-        lambda: d.admin_get("/node/balance")["onchain"]["confirmed_sat"] == 100_000_000,
+        lambda: d.cli("balance")["onchain"]["confirmed_sat"] == 100_000_000,
         "the new block, synced with the new cookie",
     )
     assert "d" in procs and procs["d"].poll() is None, "the mint was restarted"
-    log("bitcoind restarted with a new cookie: the running mint renewed it and kept syncing")
+    log(
+        "bitcoind restarted with a new cookie: the running mint renewed it and kept syncing"
+        " (admin HTTP off, driven by lnurl-mint-cli)"
+    )
     d.stop()
 
 
@@ -334,6 +396,8 @@ def main() -> None:
     note = a.get(f"/w?k1={k1}")
     assert note["mintPubkey"] == a.node_id() and note["c"].startswith("cs990n1"), note
     log("minted 99000 msat (100000 paid, 1000 fee), certificate signed by the node key")
+
+    mint_cli(a)
 
     if os.environ.get("UI"):
         admin_ui(a)

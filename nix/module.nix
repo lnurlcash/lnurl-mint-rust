@@ -168,6 +168,10 @@ in
   };
 
   config = mkIf cfg.enable {
+    # lnurl-mint-cli, for `sudo lnurl-mint-cli --data-dir /var/lib/lnurl-mint info`:
+    # the service's dynamic user owns the admin socket, and root may use it
+    environment.systemPackages = [ cfg.package ];
+
     networking.firewall.allowedTCPPorts = mkIf cfg.lightning.openFirewall [
       (lib.toInt (lib.last (lib.splitString ":" cfg.lightning.listen)))
     ];

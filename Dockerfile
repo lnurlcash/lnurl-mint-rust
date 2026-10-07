@@ -18,14 +18,14 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --locked --profile optimized \
-    && cp target/optimized/lnurl-mint /usr/local/bin/lnurl-mint
+    && cp target/optimized/lnurl-mint target/optimized/lnurl-mint-cli /usr/local/bin/
 
 
 # Stage 2: runtime. The binary links Bitcoin Core statically; libc and the
 # C++ runtime, both in the slim image already, are all it needs.
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 
-COPY --from=builder /usr/local/bin/lnurl-mint /usr/local/bin/lnurl-mint
+COPY --from=builder /usr/local/bin/lnurl-mint /usr/local/bin/lnurl-mint-cli /usr/local/bin/
 
 # non-root: a compromise of this process gains this UID, not root
 RUN groupadd --gid 1000 mint \

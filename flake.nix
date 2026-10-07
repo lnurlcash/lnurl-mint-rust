@@ -182,6 +182,9 @@
               machine.succeed(f"{cli} generatetoaddress 1 $({cli} getnewaddress)")
               machine.wait_until_succeeds(f"{admin}/node/balance | grep '\"confirmed_sat\":100000000'")
 
+              # the CLI, over the admin socket the service always serves
+              machine.succeed("lnurl-mint-cli --data-dir /var/lib/lnurl-mint info | grep '\"lightning\": \"ready\"'")
+
               # a graceful restart keeps the node's identity
               node_id = machine.succeed(f"{admin}/info | sed 's/.*\"mint_pubkey\":\"\\([0-9a-f]*\\)\".*/\\1/'").strip()
               machine.systemctl("restart lnurl-mint.service")

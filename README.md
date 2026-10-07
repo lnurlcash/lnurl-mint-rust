@@ -192,6 +192,10 @@ On NixOS, run it as a hardened systemd service next to nixpkgs' bitcoind:
 }
 ```
 
+`lnurl-mint-cli` is on the system's PATH; the admin socket belongs to the
+service's dynamic user, so run it as root:
+`sudo lnurl-mint-cli --data-dir /var/lib/lnurl-mint info`.
+
 The service runs as a dynamic user with a locked-down sandbox. Its state
 (seed, channels, wallet, notes) lives in `/var/lib/lnurl-mint`, mode 0700,
 and it gets 120 seconds to stop gracefully. Every other setting in
@@ -218,9 +222,38 @@ user and password in an environment file.
 Every LNURL endpoint answers HTTP 200, with `{"status": "ERROR", "reason"}` on
 failure (LUD-01).
 
+### Admin CLI
+
+`lnurl-mint-cli` runs every admin function from a shell, and works whether or
+not the admin HTTP API is on. The mint always serves its admin functions on a
+Unix socket, `<DATA_DIR>/admin.sock` (`ADMIN_SOCKET` to move it), with mode
+0600: running as the mint's own user is the authentication, so no token is
+needed. The CLI finds the socket from `DATA_DIR`, in the environment or `.env`,
+just as the mint does:
+
+```sh
+lnurl-mint-cli info                      # next to the mint's .env
+docker exec lnurl-mint-rust lnurl-mint-cli balance
+lnurl-mint-cli channels
+lnurl-mint-cli open 02abc…@host:9735 1000000 --public
+lnurl-mint-cli invoice 50000 "inbound liquidity"
+lnurl-mint-cli pay lnbc1… --max-fee-sat 50
+lnurl-mint-cli send bc1q… --all
+lnurl-mint-cli --help                    # every command
+```
+
+Replies are JSON; a refusal goes to stderr with a non-zero exit code. For a
+mint elsewhere, `--admin host:port --token …` (or `LNURL_MINT_ADMIN` and
+`ADMIN_TOKEN`) uses its admin HTTP API instead.
+
+The socket also keeps a data directory to one mint: a second mint started on
+the same `DATA_DIR` finds the first one's socket answering and refuses to
+start, before it touches the database or the node.
+
 ### Admin UI
 
-With `ADMIN_TOKEN` set, open `ADMIN_LISTEN` (default
+The admin HTTP API and web UI are optional: they are served only when
+`ADMIN_TOKEN` is set. With it set, open `ADMIN_LISTEN` (default
 `http://127.0.0.1:8112/`) in a browser and sign in with the token. The UI has
 five tabs:
 
@@ -246,7 +279,8 @@ a proxy that sets `X-Forwarded-Proto: https`, the cookie is also marked
 ### Admin API
 
 Served on `ADMIN_LISTEN` only when `ADMIN_TOKEN` is set. Every request carries
-`Authorization: Bearer <ADMIN_TOKEN>`, or the UI's session cookie:
+`Authorization: Bearer <ADMIN_TOKEN>`, or the UI's session cookie. The same
+routes, without that check, are on the admin socket the CLI uses:
 
 | | |
 |---|---|

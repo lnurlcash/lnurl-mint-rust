@@ -22,9 +22,11 @@ use crate::{
     state::AppState,
 };
 
-pub fn router(state: AppState, token: String) -> Router {
-    let auth = Arc::new(Auth::new(token));
-    let api = Router::new()
+/// The admin API itself, with no authentication of its own: served as is on
+/// the admin socket, whose file permissions are its authentication, and
+/// behind the token or session check on the admin HTTP port.
+pub fn api(state: AppState) -> Router {
+    Router::new()
         .route("/info", get(info))
         .route("/note/{note}", get(note))
         .route("/pending", get(pending))
@@ -41,11 +43,17 @@ pub fn router(state: AppState, token: String) -> Router {
         .route("/node/payment/{payment_hash}", get(payment))
         .route("/node/send", post(send))
         .route("/qr", get(admin_ui::qr))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&auth),
-            admin_ui::require_auth,
-        ))
-        .with_state(state);
+        .with_state(state)
+}
+
+/// The admin HTTP port: the API behind a bearer token or a UI session, and
+/// the UI with its login. Served only when ADMIN_TOKEN is set.
+pub fn router(state: AppState, token: String) -> Router {
+    let auth = Arc::new(Auth::new(token));
+    let api = api(state).layer(middleware::from_fn_with_state(
+        Arc::clone(&auth),
+        admin_ui::require_auth,
+    ));
     // the page and its login are public; everything they call is not
     let ui = Router::new()
         .route("/", get(admin_ui::index))
@@ -56,6 +64,54 @@ pub fn router(state: AppState, token: String) -> Router {
         .with_state(auth);
     api.merge(ui)
         .layer(middleware::from_fn(admin_ui::security_headers))
+}
+
+/// Bind the admin socket at `path`, mode 0600: only the mint's own user may
+/// connect, and that is the authentication. A socket left by a mint that
+/// crashed is replaced; one that still answers means another mint is running
+/// on this data directory, which must never happen.
+#[cfg(unix)]
+pub fn bind_socket(path: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use anyhow::{Context, bail};
+
+    // sun_path holds 108 bytes on Linux, its terminating NUL included
+    const MAX_SOCKET_PATH: usize = 107;
+    let len = path.as_os_str().len();
+    if len > MAX_SOCKET_PATH {
+        bail!(
+            "the admin socket {} is {len} bytes, more than the {MAX_SOCKET_PATH} a Unix socket's \
+             path may have: set ADMIN_SOCKET to a shorter path (e.g. /run/lnurl-mint/admin.sock)",
+            path.display()
+        );
+    }
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    if path.exists() {
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            bail!(
+                "another lnurl-mint is already running on this data directory ({} answers): \
+                 run one process per DATA_DIR",
+                path.display()
+            );
+        }
+        std::fs::remove_file(path).with_context(|| {
+            format!(
+                "could not remove the stale {}{}",
+                path.display(),
+                crate::whoami::write_hint(dir, path)
+            )
+        })?;
+    }
+    let listener = tokio::net::UnixListener::bind(path).with_context(|| {
+        format!(
+            "could not create the admin socket {}{}",
+            path.display(),
+            crate::whoami::write_hint(dir, path)
+        )
+    })?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
 type AdminResult = Result<Json<Value>, (StatusCode, String)>;
@@ -482,6 +538,34 @@ mod tests {
         // and QR codes need a session too
         let res = send(&app, get("/qr?data=bc1q").body(Body::empty()).unwrap()).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_socket_is_private_and_single() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("lnurl-mint-sock-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("admin.sock");
+
+        // a path no Unix socket can have says how to fix it
+        let long = dir.join("x".repeat(120));
+        let err = bind_socket(&long).unwrap_err().to_string();
+        assert!(err.contains("ADMIN_SOCKET"), "{err}");
+
+        // a stale file from a crash is replaced
+        std::fs::write(&path, b"").unwrap();
+        let listener = bind_socket(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // while it answers, a second mint refuses to start
+        let err = bind_socket(&path).unwrap_err().to_string();
+        assert!(err.contains("already running"), "{err}");
+        drop(listener);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

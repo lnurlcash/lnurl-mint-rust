@@ -28,9 +28,15 @@ pub struct Config {
     #[arg(long, env = "LISTEN", default_value = "127.0.0.1:8111")]
     pub listen: SocketAddr,
 
-    /// Listen address for the admin API. Served only when ADMIN_TOKEN is set.
+    /// Listen address for the admin HTTP API and web UI. Served only when
+    /// ADMIN_TOKEN is set; lnurl-mint-cli uses the admin socket either way.
     #[arg(long, env = "ADMIN_LISTEN", default_value = "127.0.0.1:8112")]
     pub admin_listen: SocketAddr,
+
+    /// The admin socket lnurl-mint-cli talks to (default:
+    /// <DATA_DIR>/admin.sock). Always served, mode 0600.
+    #[arg(long, env = "ADMIN_SOCKET")]
+    pub admin_socket: Option<PathBuf>,
 
     /// Bearer token the admin API requires.
     #[arg(long, env = "ADMIN_TOKEN", hide_env_values = true)]
@@ -134,6 +140,12 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn admin_socket(&self) -> PathBuf {
+        self.admin_socket
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("admin.sock"))
+    }
+
     pub fn database_path(&self) -> PathBuf {
         self.database_path
             .clone()
