@@ -5,10 +5,10 @@ use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, anyhow, bail};
 use clap::Parser;
-use lightning::ln::msgs::SocketAddress;
+use ldk_node::lightning::ln::msgs::SocketAddress;
 
 use crate::{
-    ln::{BitcoindAuth, BitcoindConfig, Network, NodeConfig},
+    ln::{BitcoindAuth, BitcoindConfig, LspConfig, Network, NodeConfig, parse_peer},
     state::Settings,
 };
 
@@ -78,9 +78,28 @@ pub struct Config {
     #[arg(long, env = "LN_ALIAS")]
     pub ln_alias: Option<String>,
 
+    /// A Rapid Gossip Sync server, for the network graph at startup (default:
+    /// LDK's own on bitcoin). `none` leaves it to P2P gossip.
+    #[arg(long, env = "RGS_URL")]
+    pub rgs_url: Option<String>,
+
     /// Comma-separated host:port addresses announced with public channels.
     #[arg(long, env = "LN_ANNOUNCE_ADDRESSES", value_delimiter = ',')]
     pub ln_announce_addresses: Vec<String>,
+
+    /// An LSPS2 Lightning Service Provider, pubkey@host:port: it opens this
+    /// node's first inbound channel when a bootstrap invoice is paid.
+    #[arg(long, env = "LSP_NODE")]
+    pub lsp_node: Option<String>,
+
+    /// The token the LSP asks for, if any.
+    #[arg(long, env = "LSP_TOKEN", hide_env_values = true)]
+    pub lsp_token: Option<String>,
+
+    /// Act as an LSPS2 provider. Only for the regtest end-to-end test, and
+    /// only in a build with `--features test-lsp`.
+    #[arg(long, env = "TEST_LSP", default_value_t = false, action = clap::ArgAction::Set, hide = true)]
+    pub test_lsp: bool,
 
     /// The mint's own Lightning Address username (`_` always works too).
     #[arg(long, env = "USERNAME", default_value = "mint")]
@@ -182,13 +201,31 @@ impl Config {
                 SocketAddress::from_str(a).map_err(|_| anyhow!("not an address to announce: {a}"))
             })
             .collect::<anyhow::Result<_>>()?;
+        let lsp = match self.lsp_node.as_deref().filter(|l| !l.is_empty()) {
+            Some(peer) => {
+                let (node_id, address) = parse_peer(peer).context("LSP_NODE")?;
+                Some(LspConfig {
+                    node_id,
+                    address,
+                    token: self.lsp_token.clone().filter(|t| !t.is_empty()),
+                })
+            }
+            None => None,
+        };
         Ok(Some(NodeConfig {
             data_dir: self.data_dir.clone(),
-            network: self.network.bitcoin(),
+            network: self.network,
             bitcoind: BitcoindConfig { host, port, auth },
             listen: self.ln_listen,
             alias: self.ln_alias.clone().unwrap_or_else(|| self.title.clone()),
             announce_addresses,
+            rgs_url: match self.rgs_url.as_deref() {
+                Some("none" | "") => None,
+                Some(url) => Some(url.to_string()),
+                None => self.network.default_rgs_url().map(str::to_string),
+            },
+            lsp,
+            test_lsp: self.test_lsp,
         }))
     }
 
@@ -267,8 +304,34 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(node.bitcoind.port, 18443);
+        // regtest has no snapshot server
+        assert_eq!(node.rgs_url, None);
         assert_eq!(node.announce_addresses.len(), 2);
         assert_eq!(node.alias, "lnurl-mint");
+        assert!(node.lsp.is_none());
+        let id = "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619";
+        let node = parse(&[
+            "--bitcoind-rpc",
+            "127.0.0.1",
+            "--bitcoind-rpc-cookie",
+            "/tmp/.cookie",
+            "--lsp-node",
+            &format!("{id}@lsp.example:9735"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(node.lsp.unwrap().node_id.to_string(), id);
+        assert!(
+            parse(&[
+                "--bitcoind-rpc",
+                "127.0.0.1",
+                "--bitcoind-rpc-cookie",
+                "/c",
+                "--lsp-node",
+                id
+            ])
+            .is_err()
+        );
     }
 
     #[test]

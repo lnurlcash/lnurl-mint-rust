@@ -11,6 +11,11 @@ license = "MIT"
 name = "lnurl-mint"
 path = "src/main.rs"
 
+[features]
+# a Lightning Service Provider for the regtest end-to-end test (TEST_LSP=1):
+# never in a release build
+test-lsp = []
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
@@ -19,18 +24,10 @@ dotenvy = "0.15"
 env_logger = "0.11"
 log = "0.4"
 
-# The node. LDK 0.2 and BDK 3.2 share bitcoin 0.32. BDK persists through its
-# file store, not its `rusqlite` feature: that pins rusqlite 0.31, and two
-# libsqlite3-sys cannot link into one binary.
-bitcoin = "0.32"
-lightning = "0.2"
-lightning-background-processor = "0.2"
-lightning-block-sync = { version = "0.2", features = ["rpc-client", "tokio"] }
-lightning-invoice = { version = "0.34", features = ["std"] }
-lightning-net-tokio = "0.2"
-lightning-persister = { version = "0.2", features = ["tokio"] }
-bdk_wallet = { version = "3.2", features = ["file_store"] }
-base64 = "0.22"
+# The node: ldk-node (LDK 0.2 and BDK, chain sync, gossip, LSPS2 liquidity).
+# Its bitcoin, lightning and lightning-invoice are re-exported and used from
+# there, so the versions always agree.
+ldk-node = "0.7"
 
 lnurlcash-core = "0.2.3"
 # Bitcoin Core's script interpreter, built from source and linked statically
@@ -43,7 +40,8 @@ bech32 = "0.12"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.9"
-rusqlite = { version = "0.40", features = ["bundled"] }
+# the version ldk-node bundles: two libsqlite3-sys cannot link into one binary
+rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

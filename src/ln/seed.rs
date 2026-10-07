@@ -1,7 +1,8 @@
 //! The one secret this mint holds: a 32-byte seed in `<DATA_DIR>/seed`,
-//! created on first start. LDK's keys and the BDK wallet's descriptors are
-//! both derived from it, under separate labels, so backing up this file (with
-//! the node's channel state) backs up every key.
+//! created on first start. ldk-node's seed (node, channel and wallet keys)
+//! and the key mint-invoice preimages come from are derived from it, under
+//! separate labels, so backing up this file (with the node's channel state)
+//! backs up every key.
 
 use std::{
     fs,
@@ -10,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
+use ldk_node::bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
 
 pub struct Seed([u8; 32]);
 
@@ -55,14 +56,18 @@ impl Seed {
         Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
     }
 
-    /// The seed LDK's `KeysManager` gets: the node key and every channel key.
-    pub fn ldk(&self) -> [u8; 32] {
-        self.derive("lnurl-mint/ldk")
+    /// ldk-node's 64-byte seed: the node key, every channel key and the
+    /// on-chain wallet.
+    pub fn node(&self) -> [u8; 64] {
+        let mut seed = [0u8; 64];
+        seed[..32].copy_from_slice(&self.derive("lnurl-mint/ldk-node/0"));
+        seed[32..].copy_from_slice(&self.derive("lnurl-mint/ldk-node/1"));
+        seed
     }
 
-    /// The seed the on-chain wallet's BIP-32 master key is made from.
-    pub fn wallet(&self) -> [u8; 32] {
-        self.derive("lnurl-mint/wallet")
+    /// The key a mint invoice's preimage is derived from (see `ln::Ln`).
+    pub fn preimages(&self) -> [u8; 32] {
+        self.derive("lnurl-mint/mint-preimages")
     }
 }
 
@@ -78,7 +83,8 @@ mod tests {
         let a = Seed::load_or_create(&path).unwrap();
         let b = Seed::load_or_create(&path).unwrap();
         assert_eq!(a.0, b.0);
-        assert_ne!(a.ldk(), a.wallet());
+        assert_ne!(a.node()[..32], a.preimages());
+        assert_ne!(a.node()[..32], a.node()[32..]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

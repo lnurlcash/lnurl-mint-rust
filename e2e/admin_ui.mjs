@@ -4,7 +4,8 @@
 //   node e2e/admin_ui.mjs <admin url> <admin token> [screenshot dir]
 //
 // e2e/regtest.py runs it with UI=1. Exits non-zero on the first failed check,
-// or on any console error but the expected 401s (CSP violations included).
+// or on any console error but the expected 401s and refusals (CSP violations
+// included).
 
 import assert from 'node:assert/strict';
 import {mkdirSync} from 'node:fs';
@@ -19,10 +20,18 @@ if (!base || !token) {
 if (shots) mkdirSync(shots, {recursive: true});
 
 const problems = [];
+// refusals the test provokes on purpose, each answered 400 once
+let refusals = 0;
 const watch = (page) => {
   page.on('console', (m) => {
+    if (m.type() !== 'error') return;
     // the probe before login, a wrong token, and after logout are 401s
-    if (m.type() === 'error' && !m.text().includes('401')) problems.push(m.text());
+    if (m.text().includes('401')) return;
+    if (m.text().includes('400') && refusals > 0) {
+      refusals--;
+      return;
+    }
+    problems.push(m.text());
   });
   page.on('pageerror', (e) => problems.push(`page error: ${e.message}`));
 };
@@ -75,12 +84,20 @@ try {
   await shot(page, 'invoice');
   log('an invoice is created and its QR code renders');
 
+  // a bootstrap invoice needs an LSP, and A has none: the reason is shown
+  await page.locator('input[name=amount]').nth(1).fill('50000');
+  refusals++;
+  await page.click('text=Create bootstrap invoice');
+  await page.waitForSelector('#toast.error:not([hidden])');
+  assert.match(await page.textContent('#toast'), /no LSP configured/);
+  log('a bootstrap invoice without an LSP is refused, with the reason');
+
   // ---- wallet: a fresh address with its QR code ----
   await page.click('[data-tab=wallet]');
   await page.click('text=New receive address');
   await page.waitForFunction(() => document.querySelector('.result img.qr')?.naturalWidth > 0);
-  assert.match(await page.textContent('.result code'), /^bcrt1p/);
-  log('a fresh taproot address is shown with its QR code');
+  assert.match(await page.textContent('.result code'), /^bcrt1q/);
+  log('a fresh address is shown with its QR code');
 
   // ---- notes ----
   await page.click('[data-tab=notes]');

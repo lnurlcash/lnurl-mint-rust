@@ -84,6 +84,8 @@ in
           data directory itself. On test networks bitcoind keeps it in a 0700
           subdirectory: there, and without a cookie at all, put
           BITCOIND_RPC_USER and BITCOIND_RPC_PASSWORD in an environmentFile.
+          When bitcoind restarts and writes a new cookie, the mint exits and
+          systemd (Restart=on-failure) starts it again with the new one.
         '';
       };
     };

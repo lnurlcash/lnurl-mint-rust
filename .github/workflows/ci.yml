@@ -65,7 +65,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake libboost-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build
+      - run: cargo build --features test-lsp
       - name: Fetch Bitcoin Core
         run: |
           base=https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION

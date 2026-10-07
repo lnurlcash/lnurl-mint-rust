@@ -496,57 +496,32 @@ impl NoteStore {
 
     // ---- payments the node receives ----
 
-    /// Whether an incoming payment to `payment_hash` may be claimed: it pays
-    /// an unsettled mint invoice, or an operator's own. Anything else is
-    /// failed back, a second payment of a settled invoice included.
-    pub fn claimable(&self, payment_hash: &str) -> StoreResult<bool> {
-        let conn = self.conn();
-        let mint: Option<i64> = conn
+    /// The note an incoming payment to `payment_hash` may be claimed for: it
+    /// pays an unsettled mint invoice. Anything else is failed back, a second
+    /// payment of a settled invoice included.
+    pub fn claimable(&self, payment_hash: &str) -> StoreResult<Option<String>> {
+        Ok(self
+            .conn()
             .query_row(
-                "SELECT 1 FROM mints
+                "SELECT note_id FROM mints
                  WHERE payment_hash = ?1 AND minted = 0 AND note_id IS NOT NULL",
                 [payment_hash],
                 |row| row.get(0),
             )
-            .optional()?;
-        let operator: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM operator_invoices WHERE payment_hash = ?1 AND paid = 0",
-                [payment_hash],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(mint.is_some() || operator.is_some())
+            .optional()?)
     }
 
-    pub fn create_operator_invoice(&self, payment_hash: &str, amount_msat: u64) -> StoreResult<()> {
-        self.conn().execute(
-            "INSERT INTO operator_invoices (payment_hash, amount_msat, created_at)
-             VALUES (?1, ?2, ?3)",
-            params![payment_hash, amount_msat as i64, now() as i64],
-        )?;
-        Ok(())
-    }
-
-    /// Whether an operator invoice was paid; `None` if there is no such one.
-    pub fn operator_invoice_paid(&self, payment_hash: &str) -> StoreResult<Option<bool>> {
+    /// The note a mint invoice credits, settled or not.
+    pub fn mint_note_id(&self, payment_hash: &str) -> StoreResult<Option<String>> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT paid FROM operator_invoices WHERE payment_hash = ?1",
+                "SELECT note_id FROM mints WHERE payment_hash = ?1",
                 [payment_hash],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
-            .map(|paid| paid == 1))
-    }
-
-    /// Record a claimed payment to an operator invoice. Whether it was one.
-    pub fn settle_operator_invoice(&self, payment_hash: &str) -> StoreResult<bool> {
-        Ok(self.conn().execute(
-            "UPDATE operator_invoices SET paid = 1 WHERE payment_hash = ?1 AND paid = 0",
-            [payment_hash],
-        )? == 1)
+            .flatten())
     }
 
     /// Every note reserved by a melt, grouped by that melt's payment hash.
@@ -935,22 +910,15 @@ mod tests {
     }
 
     #[test]
-    fn only_known_unpaid_invoices_are_claimable() {
+    fn only_unpaid_mint_invoices_are_claimable() {
         let store = NoteStore::in_memory().unwrap();
         store.create_mint("h1", "lnbc", 5000, "q1").unwrap();
-        store.create_operator_invoice("o1", 9000).unwrap();
-        assert!(store.claimable("h1").unwrap());
-        assert!(store.claimable("o1").unwrap());
-        assert!(!store.claimable("nobody").unwrap());
+        assert_eq!(store.claimable("h1").unwrap().as_deref(), Some("q1"));
+        assert_eq!(store.claimable("nobody").unwrap(), None);
         store.settle_mint("h1").unwrap();
-        assert_eq!(store.operator_invoice_paid("o1").unwrap(), Some(false));
-        assert!(store.settle_operator_invoice("o1").unwrap());
-        assert!(!store.settle_operator_invoice("o1").unwrap());
-        assert_eq!(store.operator_invoice_paid("o1").unwrap(), Some(true));
-        assert_eq!(store.operator_invoice_paid("nobody").unwrap(), None);
         // a second payment of a paid invoice is failed back
-        assert!(!store.claimable("h1").unwrap());
-        assert!(!store.claimable("o1").unwrap());
+        assert_eq!(store.claimable("h1").unwrap(), None);
+        assert_eq!(store.mint_note_id("h1").unwrap().as_deref(), Some("q1"));
     }
 
     #[test]

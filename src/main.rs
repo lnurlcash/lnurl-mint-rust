@@ -21,6 +21,8 @@ mod whoami;
 
 /// How often melts left pending are looked at again.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+/// How often bitcoind's cookie is checked for a new one.
+const COOKIE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,8 +55,13 @@ async fn main() -> anyhow::Result<()> {
     log::info!("using database {}", database_path.display());
     let store = std::sync::Arc::new(store);
 
-    let ln = match config.node_config()? {
-        Some(node) => ln::Ln::start(config.network, node, std::sync::Arc::clone(&store)).await?,
+    let node_config = config.node_config()?;
+    let cookie = node_config.as_ref().and_then(|n| match &n.bitcoind.auth {
+        ln::BitcoindAuth::Cookie(path) => Some(path.clone()),
+        ln::BitcoindAuth::UserPass(..) => None,
+    });
+    let ln = match node_config {
+        Some(node) => ln::Ln::start(node, std::sync::Arc::clone(&store)).await?,
         None => {
             log::warn!(
                 "no BITCOIND_RPC: running without a Lightning node, minting and melting are unavailable"
@@ -73,9 +80,31 @@ async fn main() -> anyhow::Result<()> {
         config.listen,
         state.settings.username
     );
+    // ldk-node keeps the RPC credentials it started with: when bitcoind
+    // writes a new cookie, stop cleanly and leave the restart to the
+    // supervisor (systemd, docker's restart policy)
+    let cookie_changed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let restart = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(path) = cookie {
+        let (notify, restart) = (cookie_changed.clone(), restart.clone());
+        tokio::spawn(async move {
+            watch_cookie(&path).await;
+            log::warn!(
+                "{} changed: bitcoind restarted, shutting down to reconnect with the new cookie",
+                path.display()
+            );
+            restart.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify.notify_one();
+        });
+    }
     let server = tokio::spawn(
         axum::serve(listener, lnurl::router(state.clone()).into_make_service())
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    () = shutdown_signal() => {},
+                    () = cookie_changed.notified() => {},
+                }
+            })
             .into_future(),
     );
 
@@ -118,8 +147,24 @@ async fn main() -> anyhow::Result<()> {
     server.await.context("server task panicked")??;
     state.ln.stop().await;
     let _ = std::fs::remove_file(&socket_path);
+    if restart.load(std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("bitcoind's cookie changed: restart the mint to pick it up");
+    }
     log::info!("shut down");
     Ok(())
+}
+
+/// Returns once bitcoind's cookie holds something other than at startup. A
+/// missing cookie (bitcoind stopped) is waited out.
+async fn watch_cookie(path: &std::path::Path) {
+    let initial = std::fs::read_to_string(path).unwrap_or_default();
+    loop {
+        tokio::time::sleep(COOKIE_POLL_INTERVAL).await;
+        match std::fs::read_to_string(path) {
+            Ok(now) if !now.trim().is_empty() && now != initial => return,
+            _ => {}
+        }
+    }
 }
 
 async fn shutdown_signal() {

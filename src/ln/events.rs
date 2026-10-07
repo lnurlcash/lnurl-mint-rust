@@ -1,216 +1,126 @@
-//! LDK's events: the only place a Lightning outcome reaches the note store.
-//!
-//! - A payment arriving is claimed only if it pays an unsettled mint (or
-//!   operator) invoice; anything else is failed back.
-//! - Claimed, it credits its note.
-//! - An outgoing payment that succeeded burns the notes its melt reserved;
-//!   one that failed, once LDK says no HTLC of it is left, releases them.
-//!
-//! A store write that fails asks LDK to replay the event, which it does,
-//! across restarts too: no outcome is lost to a crash or a database error.
+//! ldk-node's events, turned into the store's state. An event is acknowledged
+//! only once the store took it: one the store failed on is delivered again,
+//! here or after a restart.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use lightning::{
-    chain::chaininterface::ConfirmationTarget,
-    events::{Event, FundingInfo, PaymentPurpose, ReplayEvent},
+use anyhow::Result;
+use ldk_node::{
+    Event, Node,
+    bitcoin::hashes::{Hash, sha256},
+    lightning_types::payment::{PaymentHash, PaymentPreimage},
 };
 
-use super::node::Node;
+use crate::db::NoteStore;
 
-fn replay(what: &str, err: impl std::fmt::Display) -> ReplayEvent {
-    log::error!("{what}: {err} - will retry");
-    ReplayEvent()
+pub(super) async fn run(node: Arc<Node>, store: Arc<NoteStore>, preimage_key: [u8; 32]) {
+    loop {
+        let event = node.next_event_async().await;
+        loop {
+            match handle(&node, &store, &preimage_key, &event) {
+                Ok(()) => break,
+                Err(e) => {
+                    log::error!("could not record {event:?}: {e:#}; retrying");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+        if let Err(e) = node.event_handled() {
+            log::error!("could not acknowledge an event: {e}");
+        }
+    }
 }
 
-pub(super) async fn handle(node: &Arc<Node>, event: Event) -> Result<(), ReplayEvent> {
+fn handle(node: &Node, store: &NoteStore, preimage_key: &[u8; 32], event: &Event) -> Result<()> {
     match event {
         Event::PaymentClaimable {
             payment_hash,
-            purpose,
-            amount_msat,
+            claimable_amount_msat,
             ..
         } => {
             let hash = hex::encode(payment_hash.0);
-            let claimable = node
-                .store
-                .claimable(&hash)
-                .map_err(|e| replay("checking an incoming payment", e))?;
-            let preimage = match purpose {
-                PaymentPurpose::Bolt11InvoicePayment {
-                    payment_preimage, ..
-                } => payment_preimage,
-                _ => None,
-            };
-            match (claimable, preimage) {
-                (true, Some(preimage)) => node.channel_manager.claim_funds(preimage),
-                _ => {
-                    log::info!("failing back an unexpected payment {hash} of {amount_msat} msat");
-                    node.channel_manager.fail_htlc_backwards(&payment_hash);
+            let preimage = store
+                .claimable(&hash)?
+                .map(|note_id| super::mint_preimage(preimage_key, &note_id))
+                .filter(|p| sha256::Hash::hash(p).to_byte_array() == payment_hash.0);
+            let result = match preimage {
+                Some(preimage) => node.bolt11_payment().claim_for_hash(
+                    *payment_hash,
+                    *claimable_amount_msat,
+                    PaymentPreimage(preimage),
+                ),
+                None => {
+                    log::warn!("failing back a payment to {hash}: no unpaid mint invoice");
+                    node.bolt11_payment().fail_for_hash(*payment_hash)
                 }
+            };
+            if let Err(e) = result {
+                log::error!("could not resolve the payment to {hash}: {e}");
             }
         }
-        Event::PaymentClaimed {
+        Event::PaymentReceived {
             payment_hash,
             amount_msat,
             ..
         } => {
             let hash = hex::encode(payment_hash.0);
-            match node
-                .store
-                .settle_mint(&hash)
-                .map_err(|e| replay("crediting a mint", e))?
-            {
-                Some((note_id, net)) => log::info!(
-                    "MINT payment_hash={hash} note={note_id} net_msat={net} received_msat={amount_msat}"
-                ),
-                None => {
-                    if node
-                        .store
-                        .settle_operator_invoice(&hash)
-                        .map_err(|e| replay("recording an operator payment", e))?
-                    {
-                        log::info!("received {amount_msat} msat on operator invoice {hash}");
-                    }
+            match store.settle_mint(&hash)? {
+                Some((note_id, value)) => {
+                    log::info!("MINT {note_id} {value} msat (paid {amount_msat} msat, {hash})")
                 }
+                None => log::info!("received {amount_msat} msat to {hash}"),
             }
         }
-        Event::PaymentSent {
+        Event::PaymentSuccessful {
             payment_hash,
             payment_preimage,
             fee_paid_msat,
             ..
         } => {
             let hash = hex::encode(payment_hash.0);
-            let preimage = hex::encode(payment_preimage.0);
-            let (burned, amount) = node
-                .store
-                .finalize_melt(&hash, Some(&preimage))
-                .map_err(|e| replay("burning melted notes", e))?;
-            if burned.is_empty() {
-                log::info!("payment {hash} sent, routing fee {fee_paid_msat:?} msat");
-            } else {
+            let preimage = payment_preimage.map(|p| hex::encode(p.0));
+            let (burned, total) = store.finalize_melt(&hash, preimage.as_deref())?;
+            if !burned.is_empty() {
                 log::info!(
-                    "MELT payment_hash={hash} notes={burned:?} amount_msat={amount} routing_fee_msat={fee_paid_msat:?}"
+                    "MELT {hash}: {} note(s), {total} msat, fee {} msat",
+                    burned.len(),
+                    fee_paid_msat.unwrap_or(0)
                 );
             }
         }
         Event::PaymentFailed {
-            payment_hash: Some(payment_hash),
+            payment_hash: Some(PaymentHash(hash)),
             reason,
             ..
         } => {
-            let hash = hex::encode(payment_hash.0);
-            let restored = node
-                .store
-                .restore_melt(&hash)
-                .map_err(|e| replay("restoring melted notes", e))?;
-            log::info!("payment {hash} failed ({reason:?}), restored {restored:?}");
-        }
-        Event::PaymentFailed { .. } => {}
-        Event::FundingGenerationReady {
-            temporary_channel_id,
-            counterparty_node_id,
-            channel_value_satoshis,
-            output_script,
-            ..
-        } => {
-            let fee = node.sat_per_kw(ConfirmationTarget::NonAnchorChannelFee);
-            let funded = node.wallet.pay_to(
-                output_script,
-                bitcoin::Amount::from_sat(channel_value_satoshis),
-                fee,
-            );
-            match funded {
-                Ok(tx) => {
-                    let txid = tx.compute_txid();
-                    if let Err(e) = node.channel_manager.funding_transaction_generated(
-                        temporary_channel_id,
-                        counterparty_node_id,
-                        tx,
-                    ) {
-                        log::warn!(
-                            "channel {temporary_channel_id} went away before funding: {e:?}"
-                        );
-                        node.wallet.forget(txid);
-                    }
-                }
-                Err(e) => {
-                    log::error!("could not fund channel {temporary_channel_id}: {e:#}");
-                    let _ = node.channel_manager.force_close_broadcasting_latest_txn(
-                        &temporary_channel_id,
-                        &counterparty_node_id,
-                        "could not fund the channel".into(),
-                    );
-                }
+            let hash = hex::encode(hash);
+            let restored = store.restore_melt(&hash)?;
+            if !restored.is_empty() {
+                log::info!(
+                    "melt {hash} failed ({reason:?}): {} note(s) released",
+                    restored.len()
+                );
             }
         }
-        Event::DiscardFunding {
-            funding_info: FundingInfo::Tx { transaction },
-            ..
-        } => node.wallet.forget(transaction.compute_txid()),
-        Event::OpenChannelRequest {
-            temporary_channel_id,
-            counterparty_node_id,
-            ..
-        } => {
-            let user_channel_id = u128::from_be_bytes(rand::random());
-            if let Err(e) = node.channel_manager.accept_inbound_channel(
-                &temporary_channel_id,
-                &counterparty_node_id,
-                user_channel_id,
-                None,
-            ) {
-                log::warn!("could not accept a channel from {counterparty_node_id}: {e:?}");
-            }
-        }
-        Event::SpendableOutputs {
-            outputs,
-            channel_id,
-        } => {
-            node.sweeper
-                .track_spendable_outputs(outputs, channel_id, false, None)
-                .await
-                .map_err(|()| replay("tracking spendable outputs", "sweeper refused"))?;
-        }
-        Event::BumpTransaction(bump) => node.bump_handler.handle_event(&bump).await,
         Event::ChannelPending {
             channel_id,
             counterparty_node_id,
             ..
-        } => log::info!("channel {channel_id} with {counterparty_node_id} is pending"),
+        } => log::info!("channel {channel_id} with {counterparty_node_id} pending"),
         Event::ChannelReady {
             channel_id,
             counterparty_node_id,
             ..
-        } => log::info!("channel {channel_id} with {counterparty_node_id} is ready"),
-        Event::ChannelClosed {
-            channel_id,
-            reason,
-            counterparty_node_id,
-            ..
         } => log::info!(
-            "channel {channel_id} with {} closed: {reason}",
+            "channel {channel_id} ready{}",
             counterparty_node_id
-                .map(|id| id.to_string())
+                .map(|p| format!(" with {p}"))
                 .unwrap_or_default()
         ),
-        Event::ConnectionNeeded { node_id, addresses } => {
-            let node = Arc::clone(node);
-            tokio::spawn(async move {
-                for address in addresses {
-                    let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&address) else {
-                        continue;
-                    };
-                    for addr in addrs {
-                        if node.connect(node_id, addr).await.is_ok() {
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-        _ => {}
+        Event::ChannelClosed {
+            channel_id, reason, ..
+        } => log::info!("channel {channel_id} closed: {reason:?}"),
+        other => log::debug!("{other:?}"),
     }
     Ok(())
 }

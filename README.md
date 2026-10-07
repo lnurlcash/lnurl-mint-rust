@@ -2,8 +2,9 @@
 
 An [LNURLcash](https://github.com/lnurl/luds/blob/luds/25.md) mint, bearer
 notes on LNURL-withdraw links (LUD-25) with deterministic notes and Lightning
-Address auto-mint (LUD-26), that is its own Lightning node: LDK for Lightning,
-BDK for the on-chain wallet, in one binary. There are no lnd, cln or spark
+Address auto-mint (LUD-26), that is its own Lightning node:
+[ldk-node](https://github.com/lightningdevkit/ldk-node) (LDK for Lightning,
+BDK for the on-chain wallet) in one binary. There are no lnd, cln or spark
 backends to configure.
 
 It is a rewrite of [lnurl-mint](../lnurl-mint) (Python) built on the code of
@@ -13,33 +14,37 @@ Rust. Note handling comes from
 spend opens its note is decided by Bitcoin Core's own interpreter, through
 [`lnurlcash-kernel`](https://github.com/lnurlcash/kernel).
 
-**Status: phases 0–2 of [PLAN.md](PLAN.md), and most of 3.** The node runs
+**Status: phases 0–3 of [PLAN.md](PLAN.md) are done.** The node runs
 in-process and the money paths work against real nodes on regtest: minting,
-melting, LUD-21 verify, `cs1` certificates signed by the node key, restarts,
-and crash recovery. It passes
+rotate, split, merge and melting, LUD-21 verify, `cs1` certificates signed by
+the node key, restarts, and crash recovery. On mainnet the node fetches the
+network graph by Rapid Gossip Sync at startup, so it can route melts right
+away. It passes
 [lnurlcash-conformance](https://www.npmjs.com/package/lnurlcash-conformance)'s
-grader against a live regtest mint. It ships as a Docker image and a nix
-flake with a NixOS module. Not yet: NIP-57 zaps, Rapid Gossip Sync, LSPS2
-inbound liquidity.
+grader against a live regtest mint. A fresh mint gets its first inbound
+channel from an LSPS2 provider (see "Inbound liquidity"). It ships as a Docker
+image and a nix flake with a NixOS module. Not yet: NIP-57 zaps.
 
 ## How it differs from lnurl-mint and cln-mint
 
-* **One funding source: this process.** LDK runs the node, BDK the on-chain
-  wallet, both syncing from your bitcoind. There are no RPC credentials to an
+* **One funding source: this process.** ldk-node runs the node and its
+  on-chain wallet, syncing from your bitcoind. There are no RPC credentials to an
   external node, so the mint now needs its own channels and liquidity (see
   "Running a node").
-* **Settlement is pushed by LDK events, never polled.** A payment arriving is
-  claimed only if it pays an unsettled mint invoice (anything else is failed
-  back), and its note is credited as it is claimed. A melt's notes burn on
-  `PaymentSent` and are released on `PaymentFailed`, which LDK emits only once
-  no HTLC of the payment is left. A store write that fails makes LDK replay
-  the event, across restarts too.
+* **Settlement is pushed by the node's events, never polled.** A payment
+  arriving is claimed only if it pays an unsettled mint invoice (anything else
+  is failed back), and its note is credited once it is claimed. A melt's notes
+  burn on `PaymentSuccessful` and are released on `PaymentFailed`, which comes
+  only once no HTLC of the payment is left. Events sit in a persisted queue
+  and are acknowledged only after the store took them, so a store write that
+  fails is retried, across restarts too.
 * **A melt that provably cannot leave is answered with its reason** (for
   example "Could not find a route to pay this invoice."), its notes are
   released and its invoice stays usable. lnurl-mint answers `OK` first and
   reports nothing. Once a payment has left, the answer is `OK` as before.
-* **No preimage is stored for a mint invoice.** LDK derives it from the node's
-  keys, and LUD-21 recomputes it from the invoice's payment secret.
+* **No preimage is stored for a mint invoice.** It is derived from the seed
+  and the note the invoice credits (a note id names one mint invoice ever),
+  and LUD-21 recomputes it the same way.
 * **Mint invoices commit to the LUD-06 metadata by `description_hash`**, as in
   cln-mint. Legacy 65-byte `ck1`s are refused, and registration proofs bind
   the domain (LUD-26), as in cln-mint.
@@ -69,17 +74,27 @@ the process.
 
 ### Running a node
 
-On first start the mint creates `<DATA_DIR>/seed`, the one secret both the
-node's keys and the wallet's are derived from. **Back up the whole data
-directory**: the seed alone does not recover channel funds, and restoring an
-old copy of `ldk/` while channels are open can lose them, as with any
-Lightning node.
+**The network graph.** To route melts, the node needs a map of the public
+Lightning network. On mainnet it downloads one at startup by Rapid Gossip
+Sync from LDK's server (`rapidsync.lightningdevkit.org`): about 2 MB the
+first time, then only the changes, periodically. Gossip from the node's own
+peers keeps updating the same graph. The server is semi-trusted: it can
+leave channels out, which makes some routes fail, but it can't take funds.
+`RGS_URL` points the node at another server, and `RGS_URL=none` turns this
+off. Other networks have no default server; there the graph comes from peer
+gossip alone. Admin `info` shows the graph's size and the last sync.
+
+On first start the mint creates `<DATA_DIR>/seed`, the one secret the
+node's keys, the wallet's and the mint invoices' preimages are derived from.
+**Back up the whole data directory**: the seed alone does not recover channel
+funds, and restoring an old copy of `ldk-node/` while channels are open can
+lose them, as with any Lightning node.
 
 ```
 <DATA_DIR>/seed           32 bytes, mode 0600
-<DATA_DIR>/ldk/           LDK: channel manager and monitors, graph, scorer, sweeper, peers.json
-<DATA_DIR>/wallet.bdk     the on-chain wallet
+<DATA_DIR>/ldk-node/      ldk-node: channel manager and monitors, wallet, payments, peers, graph
 <DATA_DIR>/mint.sqlite3   the notes
+<DATA_DIR>/admin.sock     the admin socket, while the mint runs
 ```
 
 The node needs outbound liquidity to pay melts and inbound liquidity to be
@@ -88,6 +103,37 @@ open channels (`POST /node/channels`), and let a peer open one to you (inbound
 channels are accepted). Channels are anchor channels, so keep some confirmed
 coins in the wallet: closing a channel pays its fee from them. Funds from a
 closed channel are swept back to the wallet.
+
+### Inbound liquidity: bootstrapping a channel
+
+A new mint can't be paid: nobody has a channel to it. Opening one yourself
+gives you outbound liquidity only. An LSPS2 Lightning Service Provider opens
+a channel *to* the mint, "just in time", when a payment for it arrives. To
+bootstrap:
+
+1. Set `LSP_NODE=pubkey@host:port` (and `LSP_TOKEN` if the LSP asks for one)
+   and restart the mint.
+2. **Create a bootstrap invoice and pay it from outside the mint**, from any
+   Lightning wallet of your own:
+
+   ```sh
+   lnurl-mint-cli bootstrap 100000 --max-fee-sat 2000
+   ```
+
+   (or the admin UI's Payments tab, or `POST /node/bootstrap`). The LSP holds
+   the payment, opens a channel to the mint, and forwards the payment over
+   it, keeping its opening fee. The rest lands on the mint's side of the new
+   channel: it is the operator's money, not a note.
+3. The channel is usable at once (zero-conf), and the mint can be paid for
+   mints. `lnurl-mint-cli channels` shows it.
+
+The bootstrap invoice must be paid from outside: this mint has no channel yet
+to pay it with, and a wallet melting a note into it would just move value in a
+circle. `--max-fee-sat` caps what the LSP may keep; without it, any fee the
+LSP quotes is accepted. The LSP is trusted in two ways: it broadcasts the
+zero-conf funding transaction, and since a fresh mint has no on-chain coins
+for an anchor reserve, it is trusted to get the channel's commitment
+confirmed if the channel is closed.
 
 Stop the mint with SIGTERM/Ctrl-C: it writes the channel state on the way
 out. A hard kill (SIGKILL, power loss) just after a payment can leave LDK's
@@ -131,9 +177,12 @@ with bitcoind's own permissions; nothing changes on bitcoind's side:
   and the data directory is group-searchable (`chmod g+x`); the container gets
   the cookie's group.
 
-bitcoind writes a new cookie each time it restarts. When an RPC call fails
-and the cookie has changed, the mint picks up the new one and retries, so a
-bitcoind restart needs no mint restart.
+bitcoind writes a new cookie each time it restarts, and the node keeps the
+credentials it started with. So the mint watches the cookie: when it changes,
+the mint shuts down cleanly with a non-zero exit code, and its supervisor
+starts it again with the new cookie (`make run` uses `--restart always`, the
+NixOS module `Restart=on-failure`). Run it under a supervisor when you use a
+cookie, or use `BITCOIND_RPC_USER`/`_PASSWORD`.
 
 The image runs as a non-root user (uid 1000) with `DATA_DIR=/data`: keep that
 volume, it holds the seed and the channels. `--network host` lets
@@ -236,7 +285,8 @@ lnurl-mint-cli info                      # next to the mint's .env
 docker exec lnurl-mint-rust lnurl-mint-cli balance
 lnurl-mint-cli channels
 lnurl-mint-cli open 02abc…@host:9735 1000000 --public
-lnurl-mint-cli invoice 50000 "inbound liquidity"
+lnurl-mint-cli invoice 50000 "top up"
+lnurl-mint-cli bootstrap 100000 --max-fee-sat 2000   # see "Inbound liquidity"
 lnurl-mint-cli pay lnbc1… --max-fee-sat 50
 lnurl-mint-cli send bc1q… --all
 lnurl-mint-cli --help                    # every command
@@ -295,9 +345,10 @@ routes, without that check, are on the admin socket the CLI uses:
 | `GET /node/channels`, `POST /node/channels` `{"peer", "amount_sat", "public"}` | List or open channels (`peer` may be `pubkey@host:port`). |
 | `POST /node/channels/close` `{"channel_id", "force"}` | Close a channel. |
 | `POST /node/invoice` `{"amount_msat", "description"}` | An invoice paying the node itself, crediting no note. |
-| `GET /node/invoice/<payment_hash>` | Whether such an invoice was paid. |
+| `POST /node/bootstrap` `{"amount_msat", "description", "max_fee_msat"}` | A bootstrap invoice: paid from outside, the LSP opens a channel to the node. |
+| `GET /node/invoice/<payment_hash>` | Whether such an invoice (or a bootstrap one) was paid. |
 | `POST /node/pay` `{"bolt11", "max_fee_msat"}` | Pay from the node's liquidity. |
-| `GET /node/payment/<payment_hash>` | `complete`, `pending` or `absent`. |
+| `GET /node/payment/<payment_hash>` | `complete`, `pending`, `failed` or `absent`. |
 | `POST /node/send` `{"address", "amount_sat"}` | Send on-chain (everything, without `amount_sat`). |
 | `GET /qr?data=` | An SVG QR code, for the UI. |
 
@@ -342,26 +393,32 @@ interpreter, the store's transactions and migrations, the protocol over HTTP
 for everything that needs no Lightning, and checks that `cs1` signatures are
 byte-identical to LDK's own `signmessage`.
 
-The money paths run end to end on regtest, with a real bitcoind and three
-mint processes (A under test, B paying and being paid, C unreachable):
+The money paths run end to end on regtest, with a real bitcoind and mint
+processes: A under test, B paying and being paid and acting as an LSPS2
+provider, C unreachable, F fresh, D on its own cookie-authenticated bitcoind.
+B's LSP needs a build with `--features test-lsp`, which `make e2e` does:
 
 ```sh
 make e2e BITCOIN_BIN=/path/to/bitcoin-31.1/bin
 # which is: npm ci --prefix e2e; npx --prefix e2e playwright install chromium
+#           cargo build --features test-lsp
 #           CONFORM=1 UI=1 MINT_BIN=target/debug/lnurl-mint python3 e2e/regtest.py
 ```
 
 `e2e/regtest.py` covers:
-* channel opens funded from the BDK wallet;
+* channel opens funded from the node's on-chain wallet;
 * a real mint and its LUD-21 proof, a rotate, a real melt and its proof;
 * a melt that can't be routed: refused, note kept;
+* LSPS2: a fresh mint F with no funds and no channels creates a bootstrap
+  invoice, A pays it, B opens a channel to F, and F mints its first note;
 * a restart with reconnection;
-* a crash between reserving a melt's notes and sending it: the note is
-  released on start;
+* a crash between reserving a melt's notes and sending it: once a channel is
+  usable again the melt is sent, the payee paid once, and the note burned;
 * a SIGKILL mid-melt: the note burns exactly when the payee was paid, and a
   force-closed channel's funds are swept back;
 * bitcoind restarting with a new cookie under a running mint that
-  authenticates by cookie: the mint keeps syncing without a restart.
+  authenticates by cookie: the mint exits cleanly, non-zero, and once
+  restarted syncs with the new cookie.
 
 Two optional steps:
 

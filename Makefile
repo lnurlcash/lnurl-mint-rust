@@ -37,7 +37,7 @@ e2e/node_modules: e2e/package.json e2e/package-lock.json
 # the regtest end-to-end test with the conformance grader and the admin UI in
 # a headless browser; needs BITCOIN_BIN=/path/to/bitcoin/bin
 e2e: e2e/node_modules
-	cargo build
+	cargo build --features test-lsp
 	npx --prefix e2e playwright install chromium
 	CONFORM=1 UI=1 MINT_BIN=target/debug/lnurl-mint python3 e2e/regtest.py
 

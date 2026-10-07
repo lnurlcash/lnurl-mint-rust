@@ -104,7 +104,18 @@ enum Command {
         #[arg(default_value = "")]
         description: String,
     },
-    /// Whether an invoice from `invoice` was paid.
+    /// A bootstrap invoice: pay it from a wallet outside this mint, and the
+    /// LSP (LSP_NODE) opens this node's first inbound channel, keeping its
+    /// opening fee from the payment.
+    Bootstrap {
+        amount_sat: u64,
+        #[arg(default_value = "")]
+        description: String,
+        /// The most the LSP may keep as its fee (default: any).
+        #[arg(long)]
+        max_fee_sat: Option<u64>,
+    },
+    /// Whether an invoice from `invoice` or `bootstrap` was paid.
     InvoiceStatus { payment_hash: String },
     /// Pay a BOLT-11 invoice from the node's liquidity.
     Pay {
@@ -113,7 +124,7 @@ enum Command {
         #[arg(long)]
         max_fee_sat: Option<u64>,
     },
-    /// Where an outgoing payment stands: complete, pending or absent.
+    /// Where an outgoing payment stands: complete, pending, failed or absent.
     Payment { payment_hash: String },
     /// Send on-chain.
     Send {
@@ -160,6 +171,18 @@ impl Command {
             } => post(
                 "/node/invoice",
                 json!({"amount_msat": amount_sat * 1000, "description": description}),
+            ),
+            Command::Bootstrap {
+                amount_sat,
+                description,
+                max_fee_sat,
+            } => post(
+                "/node/bootstrap",
+                json!({
+                    "amount_msat": amount_sat * 1000,
+                    "description": description,
+                    "max_fee_msat": max_fee_sat.map(|f| f * 1000),
+                }),
             ),
             Command::InvoiceStatus { payment_hash } => {
                 get(format!("/node/invoice/{}", encode(payment_hash)))
@@ -448,6 +471,12 @@ mod tests {
         assert_eq!(
             request(&["invoice", "2500", "liquidity"]).unwrap().2,
             Some(json!({"amount_msat": 2_500_000, "description": "liquidity"}))
+        );
+        assert_eq!(
+            request(&["bootstrap", "50000", "--max-fee-sat", "3000"])
+                .unwrap()
+                .2,
+            Some(json!({"amount_msat": 50_000_000, "description": "", "max_fee_msat": 3_000_000}))
         );
         assert_eq!(
             request(&["pay", "lnbc1", "--max-fee-sat", "10"]).unwrap().2,

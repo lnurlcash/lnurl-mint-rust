@@ -412,8 +412,24 @@ function poll(el, check) {
   setTimeout(tick, 2000);
 }
 
+/** Show an invoice the node receives on in `out`, and watch for its payment. */
+function showInvoice(out, inv) {
+  const status = h('span', {class: 'pill warn'}, 'waiting for payment');
+  out.replaceChildren(qr(`lightning:${inv.bolt11}`), copyable(inv.bolt11, short(inv.bolt11, 16)), h('p', {}, status));
+  poll(out, async () => {
+    const s = await api(`node/invoice/${inv.payment_hash}`);
+    if (s.paid) {
+      status.textContent = 'paid';
+      status.className = 'pill ok';
+      toast('Invoice paid');
+    }
+    return s.paid;
+  });
+}
+
 function paymentsView() {
   const receiveOut = h('div', {class: 'result'});
+  const bootstrapOut = h('div', {class: 'result'});
   const payOut = h('div', {class: 'result'});
   return [
     h(
@@ -429,25 +445,36 @@ function paymentsView() {
           ],
           'Create invoice',
           async (v) => {
-            const inv = await api('node/invoice', {amount_msat: Number(v.amount) * 1000, description: v.description});
-            const status = h('span', {class: 'pill warn'}, 'waiting for payment');
-            receiveOut.replaceChildren(
-              qr(`lightning:${inv.bolt11}`),
-              copyable(inv.bolt11, short(inv.bolt11, 16)),
-              h('p', {}, status),
+            showInvoice(
+              receiveOut,
+              await api('node/invoice', {amount_msat: Number(v.amount) * 1000, description: v.description}),
             );
-            poll(receiveOut, async () => {
-              const s = await api(`node/invoice/${inv.payment_hash}`);
-              if (s.paid) {
-                status.textContent = 'paid';
-                status.className = 'pill ok';
-                toast('Invoice paid');
-              }
-              return s.paid;
-            });
           },
         ),
         receiveOut,
+      ),
+      card(
+        'Bootstrap',
+        h(
+          'p',
+          {class: 'muted'},
+          "The node's first inbound channel, from the LSP (LSP_NODE): pay this invoice from a wallet outside the mint, " +
+            'and the LSP opens a channel to the node, keeping its opening fee from the payment.',
+        ),
+        form(
+          [
+            {name: 'amount', label: 'Amount (sat)', type: 'number', min: 1, required: true},
+            {name: 'description', label: 'Description', placeholder: 'optional'},
+            {name: 'max_fee_sat', label: 'Max LSP fee (sat)', type: 'number', min: 0, help: 'Default: any fee the LSP asks.'},
+          ],
+          'Create bootstrap invoice',
+          async (v) => {
+            const body = {amount_msat: Number(v.amount) * 1000, description: v.description};
+            if (v.max_fee_sat !== '') body.max_fee_msat = Number(v.max_fee_sat) * 1000;
+            showInvoice(bootstrapOut, await api('node/bootstrap', body));
+          },
+        ),
+        bootstrapOut,
       ),
       card(
         'Pay',
@@ -473,10 +500,10 @@ function paymentsView() {
             el.reset();
             poll(payOut, async () => {
               const s = await api(`node/payment/${res.payment_hash}`);
-              const done = s.status === 'complete' || s.status === 'absent';
-              status.textContent = s.status === 'complete' ? 'paid' : s.status === 'absent' ? 'failed' : 'sending';
-              status.className = `pill ${s.status === 'complete' ? 'ok' : s.status === 'absent' ? 'bad' : 'warn'}`;
-              return done;
+              const failed = s.status === 'failed' || s.status === 'absent';
+              status.textContent = s.status === 'complete' ? 'paid' : failed ? 'failed' : 'sending';
+              status.className = `pill ${s.status === 'complete' ? 'ok' : failed ? 'bad' : 'warn'}`;
+              return s.status === 'complete' || failed;
             });
           },
         ),

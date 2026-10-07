@@ -39,6 +39,7 @@ pub fn api(state: AppState) -> Router {
         .route("/node/channels/close", post(close_channel))
         .route("/node/invoice", post(invoice))
         .route("/node/invoice/{payment_hash}", get(invoice_status))
+        .route("/node/bootstrap", post(bootstrap))
         .route("/node/pay", post(pay))
         .route("/node/payment/{payment_hash}", get(payment))
         .route("/node/send", post(send))
@@ -138,6 +139,7 @@ async fn info(State(state): State<AppState>) -> AdminResult {
         "withdraw_link": format!("{base}/w"),
         "spend_domains": s.spend_domains(),
         "mint_pubkey": state.mint_pubkey(),
+        "graph": state.ln.graph().ok(),
         "lightning": state.ln.ready().err().map(|e| e.to_string()).unwrap_or_else(|| "ready".into()),
         "min_sendable_msat": s.min_sendable(),
         "max_sendable_msat": s.max_sendable_msat,
@@ -289,17 +291,34 @@ async fn invoice(State(state): State<AppState>, Json(req): Json<NewInvoice>) -> 
     ))
 }
 
+#[derive(Deserialize)]
+struct Bootstrap {
+    amount_msat: u64,
+    #[serde(default)]
+    description: String,
+    /// The most the LSP may keep as its channel-opening fee.
+    max_fee_msat: Option<u64>,
+}
+
+/// A bootstrap invoice: paid from outside the mint, it has the LSP open the
+/// node's first inbound channel, keeping its fee from the payment.
+async fn bootstrap(State(state): State<AppState>, Json(req): Json<Bootstrap>) -> AdminResult {
+    let invoice = state
+        .ln
+        .bootstrap_invoice(req.amount_msat, &req.description, req.max_fee_msat)
+        .map_err(refused)?;
+    Ok(Json(
+        json!({"bolt11": invoice.bolt11, "payment_hash": invoice.payment_hash}),
+    ))
+}
+
 async fn invoice_status(
     State(state): State<AppState>,
     Path(payment_hash): Path<String>,
 ) -> AdminResult {
-    match state
-        .store
-        .operator_invoice_paid(&payment_hash)
-        .map_err(internal)?
-    {
+    match state.ln.invoice_paid(&payment_hash).map_err(refused)? {
         Some(paid) => Ok(Json(json!({"paid": paid}))),
-        None => Err((StatusCode::NOT_FOUND, "no such operator invoice".into())),
+        None => Err((StatusCode::NOT_FOUND, "no such invoice".into())),
     }
 }
 

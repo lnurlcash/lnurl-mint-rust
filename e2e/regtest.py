@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """End-to-end on regtest: real bitcoind, real LDK nodes, real payments.
 
-Three lnurl-mint processes share one bitcoind:
+lnurl-mint processes share one bitcoind:
 
 - A, the mint under test
-- B, a counterparty: it pays A's mint invoices and receives A's melts
+- B, a counterparty: it pays A's mint invoices and receives A's melts. It is
+  also an LSPS2 provider (TEST_LSP, a `--features test-lsp` build)
 - C, a node no one has a channel with: melting into its invoice must fail
   before anything is sent
+- F, a fresh mint with no funds and no channels: B opens its first inbound
+  channel when A pays F's bootstrap invoice
+- D, a mint on its own bitcoind, authenticating by cookie
 
 Only the public LNURL endpoints and the admin API are used, the way a wallet
 and an operator would. Needs bitcoind/bitcoin-cli (BITCOIN_BIN, a directory)
@@ -88,8 +92,10 @@ class Mint:
         rpc_port: int = RPC_PORT,
         cookie: str | None = None,
         http_admin: bool = True,
+        env: dict | None = None,
     ):
         self.name = name
+        self.extra_env = env or {}
         # without it the admin HTTP API is off, and only the CLI's socket is there
         self.http_admin = http_admin
         self.rpc_port = rpc_port
@@ -111,8 +117,9 @@ class Mint:
             ADMIN_LISTEN=f"127.0.0.1:{self.admin}",
             BITCOIND_RPC=f"127.0.0.1:{self.rpc_port}",
             LN_LISTEN=f"127.0.0.1:{self.ln}",
-            RUST_LOG=os.environ.get("E2E_RUST_LOG", "info,ldk=warn"),
+            RUST_LOG=os.environ.get("E2E_RUST_LOG", "info,ldk_node=warn,ldk_node::chain::bitcoind=off"),
         )
+        env.update(self.extra_env)
         if self.http_admin:
             env["ADMIN_TOKEN"] = TOKEN
         if self.cookie:
@@ -234,7 +241,7 @@ def mint_cli(a: "Mint") -> None:
     assert info["lightning"] == "ready" and info["mint_pubkey"] == a.node_id(), info
     assert a.cli("balance")["onchain"]["confirmed_sat"] > 0
     assert len(a.cli("channels")) >= 1
-    assert a.cli("address")["address"].startswith("bcrt1p")
+    assert a.cli("address")["address"].startswith("bcrt1q")
     invoice = a.cli("invoice", "1234", "from the cli")
     assert invoice["bolt11"].startswith("lnbcrt12340n"), invoice
     assert a.cli("invoice-status", invoice["payment_hash"]) == {"paid": False}
@@ -267,12 +274,43 @@ def admin_ui(a: "Mint") -> None:
     log("admin UI: passed")
 
 
+def bootstrap(a: "Mint", b: "Mint") -> None:
+    """LSPS2: F, a fresh mint with no funds and no channels, gets its first
+    inbound channel from B when A - a wallet outside F - pays F's bootstrap
+    invoice. F can then be paid: A mints a note on it, routed through B."""
+    f = Mint("f", 6, http_admin=False, env={"LSP_NODE": b.peer()})
+    f.start()
+    assert f.cli("channels") == [] and f.cli("balance")["onchain"]["total_sat"] == 0
+    assert f.info()["graph"]["lsp"] == b.peer()
+    invoice = f.cli("bootstrap", "100000", "bootstrap", "--max-fee-sat", "2000")
+    assert invoice["bolt11"].startswith("lnbcrt1m"), invoice
+    a.admin_post("/node/pay", {"bolt11": invoice["bolt11"], "max_fee_msat": 10_000})
+    wait_for(lambda: f.cli("invoice-status", invoice["payment_hash"])["paid"], "bootstrap paid", 120)
+    [channel] = f.cli("channels")
+    assert channel["peer"] == b.node_id() and channel["usable"], channel
+    lightning = f.cli("balance")["lightning"]
+    # 100000 sat paid, the LSP's 1% (1000 sat) kept, the channel twice the size
+    assert lightning["total_sat"] == 99_000 and lightning["inbound_msat"] > 90_000_000, lightning
+    log(
+        f"LSPS2: A paid F's bootstrap invoice, B opened a {channel['value_sat']} sat channel"
+        f" to F: 99000 sat on F's side, {lightning['inbound_msat'] // 1000} sat inbound"
+    )
+
+    k1, h = bearer_note(50)
+    minted = f.get(f"/p/cb?amount=30000&comment={h}")
+    a.admin_post("/node/pay", {"bolt11": minted["pr"], "max_fee_msat": 10_000})
+    wait_for(lambda: f.get(f"/w?k1={k1}").get("maxWithdrawable") == 29_000, "note minted on F", 60)
+    log("F minted its first note, paid by A over the LSP's channel")
+    f.stop()
+
+
 COOKIE_RPC_PORT = 18643
 
 
 def cookie_renewal() -> None:
     """bitcoind restarts, and writes a new cookie, under a running mint that
-    authenticates by cookie: the mint keeps syncing without a restart."""
+    authenticates by cookie: the mint shuts down cleanly with an error, for
+    its supervisor to restart it, and syncs again with the new cookie."""
     datadir = f"{work}/bitcoind-cookie"
     os.makedirs(datadir)
 
@@ -325,16 +363,21 @@ def cookie_renewal() -> None:
     wait_for(lambda: not os.path.exists(cookie), "cookie bitcoind stopped")
     start_bitcoind()
     assert open(cookie).read() != before, "bitcoind wrote the same cookie"
+    wait_for(lambda: procs["d"].poll() is not None, "the mint stopping on the new cookie", 60)
+    code = procs.pop("d").returncode
+    assert code != 0, f"the mint exited {code} on a new cookie: a supervisor would not restart it"
+    assert not os.path.exists(f"{d.dir}/admin.sock"), "the mint left its socket behind"
+    # what systemd or docker's restart policy does
+    d.start()
     cookie_cli("loadwallet", "miner")
     cookie_mine(1)
     wait_for(
         lambda: d.cli("balance")["onchain"]["confirmed_sat"] == 100_000_000,
         "the new block, synced with the new cookie",
     )
-    assert "d" in procs and procs["d"].poll() is None, "the mint was restarted"
     log(
-        "bitcoind restarted with a new cookie: the running mint renewed it and kept syncing"
-        " (admin HTTP off, driven by lnurl-mint-cli)"
+        f"bitcoind restarted with a new cookie: the mint stopped cleanly (exit {code}), and"
+        " restarted, synced with the new one (admin HTTP off, driven by lnurl-mint-cli)"
     )
     d.stop()
 
@@ -359,7 +402,7 @@ def main() -> None:
     cli("createwallet", "miner")
     mine(101)
 
-    a, b, c = Mint("a", 1), Mint("b", 2), Mint("c", 3)
+    a, b, c = Mint("a", 1), Mint("b", 2, env={"TEST_LSP": "true"}), Mint("c", 3)
     for mint in (a, b, c):
         mint.start()
     log(f"nodes up: A={a.node_id()[:16]}.. B={b.node_id()[:16]}..")
@@ -428,24 +471,36 @@ def main() -> None:
     assert a.get(f"/w?k1={k1c}")["maxWithdrawable"] == 49_000
     log(f"unroutable melt refused ({refused['reason']!r}), note still spendable")
 
+    bootstrap(a, b)
+
     # ---- a crash between reserving a melt's notes and sending it ----
-    # the notes are pending, but the node never heard of the payment:
-    # reconciliation at startup must release them, not leave them frozen
+    # the notes are pending and the melt recorded, but the node never heard of
+    # the payment: reconciliation at startup sends it, and B is paid once
     note_id = a.admin_get(f"/note/{hc}")["note_id"]
+    unsent = b.admin_post("/node/invoice", {"amount_msat": 49_000, "description": "unsent"})
     a.stop()
-    never_sent = "ee" * 32
     db = sqlite3.connect(f"{a.dir}/mint.sqlite3")
     with db:
         db.execute(
             "UPDATE notes SET pending = 1, pending_payment_hash = ? WHERE id = ?",
-            (never_sent, note_id),
+            (unsent["payment_hash"], note_id),
         )
-        db.execute("INSERT INTO melts (payment_hash, pr) VALUES (?, 'lnbcrt1')", (never_sent,))
+        db.execute(
+            "INSERT INTO melts (payment_hash, pr) VALUES (?, ?)",
+            (unsent["payment_hash"], unsent["bolt11"]),
+        )
     db.close()
     a.start()
-    wait_for(lambda: a.admin_get("/pending")["pending_melts"] == {}, "unsent melt reconciled")
-    assert a.get(f"/w?k1={k1c}")["maxWithdrawable"] == 49_000
-    log("restarted A after a crash before sending: the reserved note was released")
+    wait_for(lambda: a.admin_get("/pending")["pending_melts"] == {}, "unsent melt reconciled", 180)
+    assert b.admin_get(f"/node/invoice/{unsent['payment_hash']}")["paid"] is True
+    assert a.get(f"/w?k1={k1c}").get("reason") == "Note already spent."
+    log("restarted A after a crash before sending: the melt was sent then, B paid, note burned")
+
+    # a fresh note for the next melt
+    k1c, hc = bearer_note(4)
+    paid = a.get(f"/p/cb?amount=50000&comment={hc}")
+    b.admin_post("/node/pay", {"bolt11": paid["pr"]})
+    wait_for(lambda: a.get(f"/w?k1={k1c}").get("maxWithdrawable") == 49_000, "fourth note credited")
 
     # ---- killed outright mid-melt ----
     # The kill can land between LDK writing a channel monitor and writing its

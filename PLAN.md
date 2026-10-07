@@ -2,7 +2,8 @@
 
 A standalone LNURLcash mint (LUD-25 notes, LUD-26 derivation and Lightning
 Address) in one Rust binary that **is** its own Lightning node: LDK for
-Lightning, BDK for the on-chain wallet. No lnd/cln/spark backends, no REST
+Lightning, BDK for the on-chain wallet (since 2026-10-07 through ldk-node,
+see "ldk-node" under Phases). No lnd/cln/spark backends, no REST
 credentials, no funding-source trait.
 
 Sources it draws on:
@@ -209,8 +210,7 @@ node operations. Decisions taken on the way:
   SQLite `KVStore`: less code, LDK's audited one. Revisit if backups want one
   file.
 - One chain source: bitcoind RPC. Esplora is not supported yet.
-- P2P gossip only; Rapid Gossip Sync is still to do (it matters on mainnet,
-  where the first routes need a graph).
+- P2P gossip, plus Rapid Gossip Sync on mainnet (added 2026-10-07, see below).
 - Peers this node dialled are remembered in `ldk/peers.json`: private
   channels have no address in the gossip graph to reconnect to.
 - A melt that LDK refuses before registering the payment (no route, expired,
@@ -251,9 +251,54 @@ node operations. Decisions taken on the way:
   (`max_inbound_htlc_value_in_flight_percent_of_channel`). A mint therefore
   can't receive a single payment above 10% of its largest inbound channel,
   which caps the notes it can mint. Raising it means more value at risk per
-  HTLC; decide and make it a setting. Phase 4's
-`test_poc_*` ports are partly covered by the store and HTTP tests and the
-regtest test; the rest are still to port.
+  HTLC; decide and make it a setting.
+
+**Where the phases stand** (2026-10-07):
+
+- Phases 0 to 3 are done. Phase 3's milestone, the full round trip
+  against a second node, is met: mint, rotate and melt in the default regtest
+  run, and split and merge in the conformance grader's spend run
+  (`CONFORM=1`, in CI).
+- Phase 2 is done. **Rapid Gossip Sync** (2026-10-07): on mainnet the graph
+  comes from LDK's snapshot server at startup and hourly (`src/ln/rgs.rs`,
+  snapshots capped at 32 MB, applied off the async workers), and peer gossip
+  keeps updating it. LDK's testnet server serves data past LDK's two-week
+  limit, so only mainnet has a default; `RGS_URL` sets one anywhere. Tested
+  against the real mainnet snapshot (an ignored network test). The SQLite
+  `KVStore` became LDK's `FilesystemStore` by choice (above).
+- Phase 4 is partly covered by the store and HTTP tests and the regtest test;
+  the `test_poc_*` ports are still to do one by one.
+- Phases 5 and 6 haven't started; NIP-05 is in, from cln-mint.
+
+**ldk-node** (2026-10-07). The hand-wired LDK + BDK node (phases 2 and 3:
+`bitcoind.rs`, `node.rs`, `wallet.rs`, `events.rs`, `rgs.rs`, `peers.json`)
+is replaced by ldk-node 0.7, which assembles the same LDK 0.2 and BDK pieces,
+and adds LSPS2. What changed:
+
+- State lives in `<DATA_DIR>/ldk-node` (ldk-node's SQLite store: channel
+  manager and monitors, wallet, payments, peers, graph). The 64-byte entropy
+  is derived from the existing `seed`; the mint-preimage key from the seed
+  too, under another label. Not compatible with a data directory of the
+  hand-wired node: there were no deployments to migrate.
+- Mint invoices are manual claims (`receive_for_hash`): the preimage is
+  `HMAC(seed key, note id)`, and the mint claims on `PaymentClaimable` only
+  for an unsettled mint invoice. Events are acknowledged (`event_handled`)
+  only after the store took them.
+- Operator invoices are ldk-node's own (`receive`): the `operator_invoices`
+  table is no longer written.
+- Reconcile follows ldk-node's payment store: Succeeded burns, Failed
+  releases, Pending waits, and a payment it never heard of (a crash between
+  `mark_pending` and `send`) is sent again, its original invoice, once a
+  channel is usable. ldk-node records a send refused before anything left as
+  Failed, so such a melt is released on the next round.
+- bitcoind cookie: ldk-node keeps the credentials it was built with, so the
+  mint watches the cookie and exits non-zero when it changes, for its
+  supervisor to restart it.
+- **LSPS2 inbound liquidity**: `LSP_NODE`/`LSP_TOKEN`, and a bootstrap
+  invoice (`receive_via_jit_channel`) paid from outside the mint has the LSP
+  open the first inbound channel. The LSP is a zero-conf and no-anchor-reserve
+  trusted peer. A test LSP (`--features test-lsp`, `TEST_LSP=true`) runs in
+  the regtest test.
 
 0. **Skeleton.** Cargo workspace with one binary. Pin LDK, BDK, core and
    kernel. CI runs fmt, clippy and `cargo test` (the kernel build needs

@@ -302,7 +302,7 @@ impl AppState {
         }
         let invoice = self
             .ln
-            .create_invoice(amount, &metadata)
+            .create_invoice(amount, &metadata, &note_id)
             .map_err(MintError::Internal)?;
         self.store
             .create_mint(&invoice.payment_hash, &invoice.bolt11, net, &note_id)?;
@@ -326,7 +326,10 @@ impl AppState {
             return Ok(compact(json!({
                 "status": "OK",
                 "settled": settled,
-                "preimage": if settled { self.ln.invoice_preimage(&pr) } else { None },
+                "preimage": match self.store.mint_note_id(payment_hash)? {
+                    Some(note_id) if settled => Some(hex::encode(self.ln.mint_preimage(&note_id))),
+                    _ => None,
+                },
                 "pr": pr,
             })));
         }
@@ -596,6 +599,15 @@ impl AppState {
         }
     }
 
+    /// What the notes reserved by a melt are worth: its invoice's amount.
+    fn melt_total(&self, note_ids: &[String]) -> MintResult<u64> {
+        let mut total = 0;
+        for id in note_ids {
+            total += self.store.note_record(id)?.map_or(0, |r| r.amount_msat);
+        }
+        Ok(total)
+    }
+
     fn melt_in_flight(&self, payment_hash: &str) -> bool {
         self.in_flight_melts
             .lock()
@@ -607,11 +619,12 @@ impl AppState {
     /// reserving the notes and handing the payment to the node, or an event
     /// lost to an earlier version. Returns what was done, by payment hash.
     ///
-    /// A payment the node does not list, whose success it never reported, was
-    /// never sent (LDK's own `list_recent_payments` contract; on reload the
-    /// node rebuilds in-flight payments from its channel monitors), so its
-    /// notes are released. A success it lists but whose event is still
-    /// queued burns them; anything in flight is left to its event.
+    /// The node's payment store decides: a success burns the notes, a failure
+    /// releases them, a pending payment is left to its event. A payment the
+    /// store never heard of is sent again, its original invoice, once a
+    /// channel is usable: LDK keys it by payment hash, so it can never go out
+    /// twice. A resend refused before anything left is recorded as failed by
+    /// the node, and released on the next round.
     pub fn reconcile_pending_melts(&self) -> MintResult<Value> {
         let mut report = Map::new();
         for (hash, note_ids) in self.store.pending_melts()? {
@@ -627,11 +640,35 @@ impl AppState {
                     );
                     "finalized"
                 }
-                Ok(PayStatus::Absent) => {
+                Ok(PayStatus::Failed) => {
                     self.store.restore_melt(&hash)?;
-                    log::info!("reconcile: melt {hash} was never sent - restored {note_ids:?}");
+                    log::info!("reconcile: melt {hash} failed - restored {note_ids:?}");
                     "restored"
                 }
+                // still reconnecting: a send now could only fail
+                Ok(PayStatus::Absent) if !self.ln.has_usable_channel() => "waiting for a channel",
+                Ok(PayStatus::Absent) => match self.store.melt_pr(&hash)? {
+                    Some(pr) => {
+                        let total = self.melt_total(&note_ids)?;
+                        match self.ln.pay(&pr, self.settings.melt_fee_limit_msat(total)) {
+                            Ok(()) | Err(PayError::InFlight) => {
+                                log::info!("reconcile: melt {hash} was never sent - sent it now");
+                                "resent"
+                            }
+                            Err(PayError::NotSent(reason)) => {
+                                log::warn!(
+                                    "reconcile: melt {hash} could not be sent ({reason}); the node \
+                                     recorded it failed, its notes are released next round"
+                                );
+                                "unsent"
+                            }
+                        }
+                    }
+                    None => {
+                        log::warn!("reconcile: melt {hash} has no invoice on record");
+                        "unknown"
+                    }
+                },
                 Ok(PayStatus::Pending) => "pending",
                 Err(e) => {
                     log::warn!("reconcile: melt {hash}: {e:#}");
