@@ -17,6 +17,7 @@ mod spend;
 mod state;
 #[cfg(test)]
 mod vectors;
+mod whoami;
 
 /// How often melts left pending are looked at again.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
@@ -37,8 +38,14 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("could not create {}", config.data_dir.display()))?;
     let database_path = config.database_path();
-    let store = db::NoteStore::open(&database_path.to_string_lossy())
-        .map_err(|e| anyhow::anyhow!("could not open {}: {e}", database_path.display()))?;
+    let store = db::NoteStore::open(&database_path.to_string_lossy()).map_err(|e| {
+        let dir = database_path.parent().unwrap_or(&config.data_dir);
+        anyhow::anyhow!(
+            "could not open {}: {e}{}",
+            database_path.display(),
+            whoami::write_hint(dir, &database_path)
+        )
+    })?;
     log::info!("using database {}", database_path.display());
     let store = std::sync::Arc::new(store);
 

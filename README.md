@@ -112,20 +112,28 @@ docker run -d --name lnurl-mint-rust --network host --stop-timeout 60 \
   lnurlcash/lnurl-mint-rust
 ```
 
-Or build it yourself with `make build` (`docker build -t lnurl-mint-rust .`);
-`make run` starts that local build the same way, with `.env`. It also mounts
-bitcoind's RPC cookie:
-* The default is `~/.bitcoin/.cookie`; override it with
-  `make run BITCOIN_COOKIE=/var/lib/bitcoind/.cookie`.
-* The cookie's directory is mounted read-only at `/bitcoin`, and
-  `BITCOIND_RPC_COOKIE` points there.
-* The directory is mounted rather than the file because bitcoind writes a new
-  cookie on each restart, and a single-file mount would keep the old one.
-* The container runs as uid 1000 and gets the cookie's group: give bitcoind
-  `rpccookieperms=group` unless the cookie is already readable by uid 1000.
+Or build it yourself with `make build` (`docker build -t lnurl-mint-rust .`).
+`make run` starts it with `.env`; `make run IMAGE_NAME=lnurlcash/lnurl-mint-rust`
+runs the released image instead. It runs the container as the user running
+`make` (`--user`), with its state in `./data`, owned by that user
+(`DATA=/path` to move it).
 
-The mint reads the cookie when it starts. After bitcoind restarts, restart
-the mint too (`docker restart -t 60 lnurl-mint-rust`).
+Run it as the user bitcoind runs as, and the mint reads bitcoind's RPC cookie
+with bitcoind's own permissions; nothing changes on bitcoind's side:
+* The default cookie is `~/.bitcoin/.cookie`; override it with
+  `make run BITCOIN_COOKIE=/home/bitcoin/bitcoin/.cookie`.
+* Its directory is mounted read-only at `/bitcoin`, and `BITCOIND_RPC_COOKIE`
+  points there. The directory is mounted rather than the file because bitcoind
+  writes a new cookie on each restart, and a single-file mount would keep the
+  old one.
+* `make run` warns when the container won't be able to read the cookie.
+  Running as another user also works if bitcoind has `rpccookieperms=group`
+  and the data directory is group-searchable (`chmod g+x`); the container gets
+  the cookie's group.
+
+bitcoind writes a new cookie each time it restarts. When an RPC call fails
+and the cookie has changed, the mint picks up the new one and retries, so a
+bitcoind restart needs no mint restart.
 
 The image runs as a non-root user (uid 1000) with `DATA_DIR=/data`: keep that
 volume, it holds the seed and the channels. `--network host` lets
@@ -317,7 +325,9 @@ make e2e BITCOIN_BIN=/path/to/bitcoin-31.1/bin
 * a crash between reserving a melt's notes and sending it: the note is
   released on start;
 * a SIGKILL mid-melt: the note burns exactly when the payee was paid, and a
-  force-closed channel's funds are swept back.
+  force-closed channel's funds are swept back;
+* bitcoind restarting with a new cookie under a running mint that
+  authenticates by cookie: the mint keeps syncing without a restart.
 
 Two optional steps:
 

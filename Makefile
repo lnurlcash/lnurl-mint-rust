@@ -1,8 +1,7 @@
 .PHONY: all format lint check test e2e build run release
 
-IMAGE_NAME = lnurl-mint-rust
+IMAGE_NAME = lnurlcash/lnurl-mint-rust
 CONTAINER_NAME = lnurl-mint-rust
-VOLUME_NAME = lnurl-mint-rust
 
 all: format lint
 
@@ -47,12 +46,20 @@ build:
 
 ENV_FILE ?= $(wildcard .env)
 
+# The container runs as whoever runs `make run` (--user), as lnurl-mint's does:
+# run it as the user bitcoind runs as, and it reads bitcoind's cookie with
+# bitcoind's own permissions, no rpccookieperms needed. Its state is a host
+# directory owned by that same user (DATA, default ./data), not a volume: the
+# image's own user (uid 1000) is someone else.
+RUN_UID := $(shell id -u)
+RUN_GID := $(shell id -g)
+DATA ?= $(CURDIR)/data
+
 # bitcoind's RPC cookie, for BITCOIND_RPC_COOKIE. Its directory is mounted
 # read-only, not the file: bitcoind replaces the cookie on every restart, and a
-# single-file mount would keep showing the old one. The container runs as uid
-# 1000; --group-add gives it the cookie's group, for `rpccookieperms=group`.
-# Override with BITCOIN_COOKIE=/path/to/.cookie (mainnet keeps it in the data
-# directory itself; `rpccookiefile=` can move it somewhere less exposed).
+# single-file mount would keep showing the old one. --group-add also gives the
+# container the cookie's group, for a cookie readable by group
+# (`rpccookieperms=group`). Override with BITCOIN_COOKIE=/path/to/.cookie.
 BITCOIN_COOKIE ?= $(HOME)/.bitcoin/.cookie
 COOKIE_FILE := $(wildcard $(BITCOIN_COOKIE))
 COOKIE_ARGS := $(if $(COOKIE_FILE),\
@@ -60,19 +67,34 @@ COOKIE_ARGS := $(if $(COOKIE_FILE),\
 	--group-add $(shell stat -c %g $(COOKIE_FILE)) \
 	-e BITCOIND_RPC_COOKIE=/bitcoin/$(notdir $(COOKIE_FILE)),)
 
-# host networking reaches a bitcoind on the host; the named volume keeps the
-# seed and the channels. -t 60: the node writes its channel state on SIGTERM
+# the container (this user, or the cookie's group) must read the cookie and
+# enter its directory: say how before the mint fails on it
+define CHECK_COOKIE
+f='$(COOKIE_FILE)'; d=$$(dirname "$$f"); \
+can() { set -- $$(stat -c '%u %a' "$$1") "$$2"; \
+  [ "$$1" = $(RUN_UID) ] || [ $$(( $$(echo "$$2" | rev | cut -c2) & $$3 )) -ne 0 ] || [ $$(( $$(echo "$$2" | rev | cut -c1) & $$3 )) -ne 0 ]; }; \
+can "$$f" 4 || echo "WARNING: uid $(RUN_UID) can't read $$f ($$(stat -c '%a %U:%G' "$$f")): run make as its owner, or give bitcoind rpccookieperms=group"; \
+can "$$d" 1 || echo "WARNING: uid $(RUN_UID) can't enter $$d ($$(stat -c '%a %U:%G' "$$d")): run make as its owner, or chmod g+x $$d"
+endef
+
+# host networking reaches a bitcoind on the host. -t 60: the node writes its
+# channel state on SIGTERM. DATA_DIR is pinned to the mount, whatever .env says.
 run:
 	@echo "Restarting container..."
+	docker pull $(IMAGE_NAME) 2>/dev/null || true
 	@$(if $(COOKIE_FILE),echo "Mounting bitcoind cookie $(COOKIE_FILE)",echo "No bitcoind cookie at $(BITCOIN_COOKIE) - set BITCOIN_COOKIE=... or use BITCOIND_RPC_USER/PASSWORD in .env")
+	@$(if $(COOKIE_FILE),$(CHECK_COOKIE),true)
+	mkdir -p $(DATA)
 	docker stop -t 60 $(CONTAINER_NAME) 2>/dev/null || true
 	docker rm $(CONTAINER_NAME) 2>/dev/null || true
 	docker run --restart always -d --name $(CONTAINER_NAME) \
 		--network host \
 		--stop-timeout 60 \
+		--user $(RUN_UID):$(RUN_GID) \
 		$(if $(ENV_FILE),--env-file $(ENV_FILE),) \
 		$(COOKIE_ARGS) \
-		-v $(VOLUME_NAME):/data \
+		-v $(DATA):/data \
+		-e DATA_DIR=/data \
 		$(IMAGE_NAME)
 	@echo "Container $(CONTAINER_NAME) is running"
 

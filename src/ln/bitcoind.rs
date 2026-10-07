@@ -45,10 +45,23 @@ impl BitcoindConfig {
     fn credentials(&self) -> Result<String> {
         Ok(match &self.auth {
             BitcoindAuth::UserPass(user, pass) => format!("{user}:{pass}"),
-            BitcoindAuth::Cookie(path) => std::fs::read_to_string(path)
-                .with_context(|| format!("could not read {}", path.display()))?
-                .trim()
-                .to_string(),
+            BitcoindAuth::Cookie(path) => match std::fs::read_to_string(path) {
+                Ok(cookie) => cookie.trim().to_string(),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
+                    "could not read {}: permission denied{}. bitcoind writes its cookie 0600 \
+                     inside a 0700 data directory: give bitcoind `rpccookieperms=group` \
+                     (Bitcoin Core 28+) and make the directory searchable by that group \
+                     (`chmod g+x <datadir>`), or move the cookie with `rpccookiefile=` to a \
+                     directory this user can read",
+                    path.display(),
+                    crate::whoami::process()
+                        .map(|w| format!(" for {w}"))
+                        .unwrap_or_default(),
+                ),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("could not read {}", path.display()));
+                }
+            },
         })
     }
 
@@ -363,6 +376,31 @@ mod tests {
         // a cookie that can't be read keeps the client as it is
         std::fs::remove_file(&cookie).unwrap();
         assert!(!rpc.renewed(&second));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_cookie_says_how_to_fix_it() {
+        let dir = std::env::temp_dir().join(format!("lnurl-mint-cookie-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join(".cookie");
+        std::fs::write(&cookie, "__cookie__:x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cookie, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // root reads anything: nothing to check then
+            if std::fs::read(&cookie).is_err() {
+                let err = config(BitcoindAuth::Cookie(cookie.clone()))
+                    .credentials()
+                    .unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("rpccookieperms=group") && msg.contains("uid "),
+                    "{msg}"
+                );
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
