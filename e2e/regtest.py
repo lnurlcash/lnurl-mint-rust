@@ -11,6 +11,8 @@ lnurl-mint processes share one bitcoind:
 - F, a fresh mint with no funds and no channels: B opens its first inbound
   channel when A pays F's bootstrap invoice
 - D, a mint on its own bitcoind, authenticating by cookie
+- E (with ELECTRS set), a mint whose node knows the chain only through
+  electrs: ELECTRS=/path/to/electrs, or ELECTRS=docker:<image>
 
 Only the public LNURL endpoints and the admin API are used, the way a wallet
 and an operator would. Needs bitcoind/bitcoin-cli (BITCOIN_BIN, a directory)
@@ -115,17 +117,20 @@ class Mint:
             DATA_DIR=self.dir,
             LISTEN=f"127.0.0.1:{self.http}",
             ADMIN_LISTEN=f"127.0.0.1:{self.admin}",
-            BITCOIND_RPC=f"127.0.0.1:{self.rpc_port}",
             LN_LISTEN=f"127.0.0.1:{self.ln}",
             RUST_LOG=os.environ.get("E2E_RUST_LOG", "info,ldk_node=warn,ldk_node::chain::bitcoind=off"),
         )
         env.update(self.extra_env)
         if self.http_admin:
             env["ADMIN_TOKEN"] = TOKEN
-        if self.cookie:
+        if "ELECTRUM_URL" in env:
+            pass  # the chain comes from electrs alone
+        elif self.cookie:
             env["BITCOIND_RPC_COOKIE"] = self.cookie
         else:
             env.update(BITCOIND_RPC_USER="u", BITCOIND_RPC_PASSWORD="p")
+        if "ELECTRUM_URL" not in env:
+            env["BITCOIND_RPC"] = f"127.0.0.1:{self.rpc_port}"
         out = open(f"{work}/{self.name}.log", "a")
         procs[self.name] = subprocess.Popen([MINT_BIN], env=env, stdout=out, stderr=out, cwd=work)
         wait_for(lambda: self.info()["lightning"] == "ready", f"{self.name} up")
@@ -304,6 +309,90 @@ def bootstrap(a: "Mint", b: "Mint") -> None:
     f.stop()
 
 
+P2P_PORT = 18544
+ELECTRUM_PORT = 18550
+
+
+def electrum_height() -> int:
+    """The chain tip electrs reports, over the Electrum protocol itself."""
+    import socket
+
+    with socket.create_connection(("127.0.0.1", ELECTRUM_PORT), timeout=5) as conn:
+        conn.sendall(b'{"id": 0, "method": "blockchain.headers.subscribe", "params": []}\n')
+        reply = conn.makefile().readline()
+    return json.loads(reply)["result"]["height"]
+
+
+def start_electrs() -> None:
+    """electrs over the shared bitcoind: a binary, or docker:<image>."""
+    spec = os.environ["ELECTRS"]
+    os.makedirs(f"{work}/electrs")
+    # electrs 0.10 authenticates by cookie file; ours holds the shared login
+    with open(f"{work}/electrs/rpc.cookie", "w") as f:
+        f.write("u:p")
+    args = [
+        "--network=regtest",
+        f"--db-dir={work}/electrs/db",
+        f"--cookie-file={work}/electrs/rpc.cookie",
+        f"--daemon-rpc-addr=127.0.0.1:{RPC_PORT}",
+        f"--daemon-p2p-addr=127.0.0.1:{P2P_PORT}",
+        f"--electrum-rpc-addr=127.0.0.1:{ELECTRUM_PORT}",
+        "--log-filters=WARN",
+    ]
+    if spec.startswith("docker:"):
+        uid = f"{os.getuid()}:{os.getgid()}"
+        cmd = ["docker", "run", "--rm", "--name", "lnurl-mint-e2e-electrs", "--network", "host",
+               "--user", uid, "-v", f"{work}/electrs:{work}/electrs", "--entrypoint", "electrs",
+               spec.removeprefix("docker:"), *args]  # fmt: skip
+    else:
+        cmd = [spec, *args]
+    out = open(f"{work}/electrs.log", "a")
+    procs["electrs"] = subprocess.Popen(cmd, stdout=out, stderr=out)
+    tip = int(cli("getblockcount"))
+    wait_for(lambda: electrum_height() >= tip, "electrs indexed the chain", 120)
+
+
+def electrum(b: "Mint") -> None:
+    """E's node learns about the chain only from electrs: its wallet's funds,
+    its own channel's funding broadcast and confirmation, a channel opened to
+    it, and then a mint and a melt over them."""
+    start_electrs()
+    e = Mint(
+        "e",
+        7,
+        http_admin=False,
+        env={"ELECTRUM_URL": f"tcp://127.0.0.1:{ELECTRUM_PORT}", "ELECTRUM_SYNC_SECS": "10"},
+    )
+    e.start()
+    graph = e.info()
+    assert graph["lightning"] == "ready", graph
+    address = e.cli("address")["address"]
+    cli("-rpcwallet=miner", "sendtoaddress", address, "0.5")
+    mine(1)
+    wait_for(lambda: e.cli("balance")["onchain"]["confirmed_sat"] == 50_000_000, "E funded via electrs", 120)
+    log("E (Electrum only) sees its wallet funded")
+
+    # E's own channel: funding broadcast through electrs; B's: seen confirming there
+    e.cli("open", b.peer(), "300000")
+    b.admin_post("/node/channels", {"peer": e.peer(), "amount_sat": 300_000})
+    wait_for(lambda: len(e.cli("channels")) == 2, "E's channels negotiated", 60)
+    time.sleep(2)
+    mine(6)
+    wait_for(lambda: sum(c["usable"] for c in e.cli("channels")) == 2, "E's channels usable", 180)
+    log("E opened a channel to B and accepted one from B, confirmations seen via electrs")
+
+    k1, h = bearer_note(70)
+    invoice = e.get(f"/p/cb?amount=40000&comment={h}")
+    b.admin_post("/node/pay", {"bolt11": invoice["pr"]})
+    wait_for(lambda: e.get(f"/w?k1={k1}").get("maxWithdrawable") == 39_000, "note minted on E", 60)
+    out = b.admin_post("/node/invoice", {"amount_msat": 39_000, "description": "e melt"})
+    assert e.get(f"/w/cb?k1={k1}&pr={out['bolt11']}")["status"] == "OK"
+    wait_for(lambda: e.get(f"/w?k1={k1}").get("reason") == "Note already spent.", "E's melt settled", 60)
+    assert b.admin_get(f"/node/invoice/{out['payment_hash']}")["paid"] is True
+    log("E minted a note paid by B and melted it back to B")
+    e.stop()
+
+
 COOKIE_RPC_PORT = 18643
 
 
@@ -394,7 +483,9 @@ def main() -> None:
             "-rpcpassword=p",
             "-fallbackfee=0.0002",
             "-txindex=0",
-            "-listen=0",
+            # P2P on loopback only: electrs fetches blocks over it
+            "-listen=1",
+            f"-bind=127.0.0.1:{P2P_PORT}",
         ],
         stdout=subprocess.DEVNULL,
     )
@@ -541,6 +632,9 @@ def main() -> None:
         wait_for(swept, "closed channel swept back to the wallet", 300)
         log("the closed channel's balance was swept back into A's on-chain wallet")
     assert stats["spent_notes"] == spent_before + spent, stats
+
+    if os.environ.get("ELECTRS"):
+        electrum(b)
 
     cookie_renewal()
 

@@ -88,6 +88,8 @@ jobs:
           CONFORM: "1"
           UI: "1"
           UI_SCREENSHOTS: e2e-screenshots
+          # electrs 0.10.10, pinned by digest: mint E syncs from it alone
+          ELECTRS: docker:getumbrel/electrs@sha256:c991fd3d8b19614fa7309525e8ccb6c0a87464f8bf6bd4dff1479b493f7308f2
           KEEP: "1"
       # the mints' logs and the UI's screenshots, when something fails
       - if: failure()

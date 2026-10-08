@@ -56,9 +56,13 @@ async fn main() -> anyhow::Result<()> {
     let store = std::sync::Arc::new(store);
 
     let node_config = config.node_config()?;
-    let cookie = node_config.as_ref().and_then(|n| match &n.bitcoind.auth {
-        ln::BitcoindAuth::Cookie(path) => Some(path.clone()),
-        ln::BitcoindAuth::UserPass(..) => None,
+    // only bitcoind's cookie changes under a running mint
+    let cookie = node_config.as_ref().and_then(|n| match &n.chain {
+        ln::ChainSource::Bitcoind(ln::BitcoindConfig {
+            auth: ln::BitcoindAuth::Cookie(path),
+            ..
+        }) => Some(path.clone()),
+        _ => None,
     });
     let ln = match node_config {
         Some(node) => ln::Ln::start(node, std::sync::Arc::clone(&store)).await?,

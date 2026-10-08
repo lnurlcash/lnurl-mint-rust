@@ -34,12 +34,15 @@ e2e/node_modules: e2e/package.json e2e/package-lock.json
 	npm ci --prefix e2e
 	touch $@
 
+# electrs for the Electrum-only mint E (empty skips it); a binary path works too
+ELECTRS ?= docker:getumbrel/electrs@sha256:c991fd3d8b19614fa7309525e8ccb6c0a87464f8bf6bd4dff1479b493f7308f2
+
 # the regtest end-to-end test with the conformance grader and the admin UI in
 # a headless browser; needs BITCOIN_BIN=/path/to/bitcoin/bin
 e2e: e2e/node_modules
 	cargo build --features test-lsp
 	npx --prefix e2e playwright install chromium
-	CONFORM=1 UI=1 MINT_BIN=target/debug/lnurl-mint python3 e2e/regtest.py
+	CONFORM=1 UI=1 ELECTRS=$(ELECTRS) MINT_BIN=target/debug/lnurl-mint python3 e2e/regtest.py
 
 build:
 	docker build --pull -t $(IMAGE_NAME) .

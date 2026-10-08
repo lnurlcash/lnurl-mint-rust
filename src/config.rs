@@ -8,7 +8,7 @@ use clap::Parser;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 
 use crate::{
-    ln::{BitcoindAuth, BitcoindConfig, LspConfig, Network, NodeConfig, parse_peer},
+    ln::{BitcoindAuth, BitcoindConfig, ChainSource, LspConfig, Network, NodeConfig, parse_peer},
     state::Settings,
 };
 
@@ -55,8 +55,9 @@ pub struct Config {
     #[arg(long, env = "NETWORK", default_value = "bitcoin")]
     pub network: Network,
 
-    /// bitcoind's RPC, host or host:port. Unset, the mint runs without a
-    /// Lightning node: rotate, split and merge work, minting and melting don't.
+    /// bitcoind's RPC, host or host:port. Unset (and no ELECTRUM_URL), the
+    /// mint runs without a Lightning node: rotate, split and merge work,
+    /// minting and melting don't.
     #[arg(long, env = "BITCOIND_RPC")]
     pub bitcoind_rpc: Option<String>,
 
@@ -69,6 +70,16 @@ pub struct Config {
     /// bitcoind's .cookie file, instead of a user and password.
     #[arg(long, env = "BITCOIND_RPC_COOKIE")]
     pub bitcoind_rpc_cookie: Option<PathBuf>,
+
+    /// An Electrum server instead of bitcoind: tcp://host:port or
+    /// ssl://host:port (electrs, Fulcrum). One can serve many mints.
+    #[arg(long, env = "ELECTRUM_URL", conflicts_with = "bitcoind_rpc")]
+    pub electrum_url: Option<String>,
+
+    /// How often the node polls the Electrum server, in seconds (at least
+    /// 10; default: ldk-node's, 80 for the wallet, 30 for channels).
+    #[arg(long, env = "ELECTRUM_SYNC_SECS", value_parser = clap::value_parser!(u64).range(10..))]
+    pub electrum_sync_secs: Option<u64>,
 
     /// Where the Lightning node accepts peers.
     #[arg(long, env = "LN_LISTEN", default_value = "0.0.0.0:9735")]
@@ -171,27 +182,20 @@ impl Config {
             .unwrap_or_else(|| self.data_dir.join("mint.sqlite3"))
     }
 
-    /// The Lightning node's configuration, or `None` without bitcoind.
+    /// The Lightning node's configuration, or `None` without a chain source.
     pub fn node_config(&self) -> anyhow::Result<Option<NodeConfig>> {
-        let Some(rpc) = &self.bitcoind_rpc else {
-            return Ok(None);
-        };
-        let (host, port) = match rpc.rsplit_once(':') {
-            Some((host, port)) => (host.to_string(), port.parse().context("BITCOIND_RPC port")?),
-            None => (rpc.clone(), self.network.default_rpc_port()),
-        };
-        let auth = match (
-            &self.bitcoind_rpc_cookie,
-            &self.bitcoind_rpc_user,
-            &self.bitcoind_rpc_password,
-        ) {
-            (Some(cookie), _, _) => BitcoindAuth::Cookie(cookie.clone()),
-            (None, Some(user), Some(password)) => {
-                BitcoindAuth::UserPass(user.clone(), password.clone())
+        let chain = match (&self.electrum_url, &self.bitcoind_rpc) {
+            (Some(url), _) => {
+                if !url.starts_with("tcp://") && !url.starts_with("ssl://") {
+                    bail!("ELECTRUM_URL is tcp://host:port or ssl://host:port, not {url:?}");
+                }
+                ChainSource::Electrum {
+                    url: url.clone(),
+                    sync_secs: self.electrum_sync_secs,
+                }
             }
-            _ => {
-                bail!("BITCOIND_RPC needs BITCOIND_RPC_COOKIE, or BITCOIND_RPC_USER and _PASSWORD")
-            }
+            (None, Some(rpc)) => ChainSource::Bitcoind(self.bitcoind(rpc)?),
+            (None, None) => return Ok(None),
         };
         let announce_addresses = self
             .ln_announce_addresses
@@ -215,7 +219,7 @@ impl Config {
         Ok(Some(NodeConfig {
             data_dir: self.data_dir.clone(),
             network: self.network,
-            bitcoind: BitcoindConfig { host, port, auth },
+            chain,
             listen: self.ln_listen,
             alias: self.ln_alias.clone().unwrap_or_else(|| self.title.clone()),
             announce_addresses,
@@ -227,6 +231,28 @@ impl Config {
             lsp,
             test_lsp: self.test_lsp,
         }))
+    }
+
+    /// bitcoind's RPC address and credentials.
+    fn bitcoind(&self, rpc: &str) -> anyhow::Result<BitcoindConfig> {
+        let (host, port) = match rpc.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), port.parse().context("BITCOIND_RPC port")?),
+            None => (rpc.to_string(), self.network.default_rpc_port()),
+        };
+        let auth = match (
+            &self.bitcoind_rpc_cookie,
+            &self.bitcoind_rpc_user,
+            &self.bitcoind_rpc_password,
+        ) {
+            (Some(cookie), _, _) => BitcoindAuth::Cookie(cookie.clone()),
+            (None, Some(user), Some(password)) => {
+                BitcoindAuth::UserPass(user.clone(), password.clone())
+            }
+            _ => {
+                bail!("BITCOIND_RPC needs BITCOIND_RPC_COOKIE, or BITCOIND_RPC_USER and _PASSWORD")
+            }
+        };
+        Ok(BitcoindConfig { host, port, auth })
     }
 
     pub fn settings(&self) -> anyhow::Result<Settings> {
@@ -303,12 +329,45 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(node.bitcoind.port, 18443);
+        match &node.chain {
+            ChainSource::Bitcoind(b) => assert_eq!(b.port, 18443),
+            other => panic!("{other:?}"),
+        }
         // regtest has no snapshot server
         assert_eq!(node.rgs_url, None);
         assert_eq!(node.announce_addresses.len(), 2);
         assert_eq!(node.alias, "lnurl-mint");
         assert!(node.lsp.is_none());
+        // Electrum instead: no bitcoind credentials needed, and not both
+        let node = parse(&[
+            "--electrum-url",
+            "tcp://electrs:50001",
+            "--electrum-sync-secs",
+            "15",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            node.chain,
+            ChainSource::Electrum { ref url, sync_secs: Some(15) } if url == "tcp://electrs:50001"
+        ));
+        assert!(parse(&["--electrum-url", "electrs:50001"]).is_err());
+        let mut both = vec!["lnurl-mint", "--base-url", "https://mint.example"];
+        both.extend([
+            "--electrum-url",
+            "tcp://e:50001",
+            "--bitcoind-rpc",
+            "127.0.0.1",
+        ]);
+        assert!(Config::try_parse_from(both).is_err());
+        let mut fast = vec!["lnurl-mint", "--base-url", "https://mint.example"];
+        fast.extend([
+            "--electrum-url",
+            "tcp://e:50001",
+            "--electrum-sync-secs",
+            "5",
+        ]);
+        assert!(Config::try_parse_from(fast).is_err());
         let id = "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619";
         let node = parse(&[
             "--bitcoind-rpc",

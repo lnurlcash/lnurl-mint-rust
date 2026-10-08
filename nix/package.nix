@@ -35,7 +35,7 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = cargoToml.package.description;
-    homepage = "https://github.com/dni/lnurl-mint-rust";
+    homepage = "https://github.com/lnurlcash/lnurl-mint-rust";
     license = lib.licenses.mit;
     mainProgram = "lnurl-mint";
     platforms = [

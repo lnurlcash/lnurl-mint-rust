@@ -28,7 +28,8 @@ image and a nix flake with a NixOS module. Not yet: NIP-57 zaps.
 ## How it differs from lnurl-mint and cln-mint
 
 * **One funding source: this process.** ldk-node runs the node and its
-  on-chain wallet, syncing from your bitcoind. There are no RPC credentials to an
+  on-chain wallet, syncing from your bitcoind, or from an Electrum server
+  (electrs, Fulcrum) in front of one. There are no RPC credentials to an
   external node, so the mint now needs its own channels and liquidity (see
   "Running a node").
 * **Settlement is pushed by the node's events, never polled.** A payment
@@ -103,6 +104,19 @@ open channels (`POST /node/channels`), and let a peer open one to you (inbound
 channels are accepted). Channels are anchor channels, so keep some confirmed
 coins in the wallet: closing a channel pays its fee from them. Funds from a
 closed channel are swept back to the wallet.
+
+### The chain: bitcoind or Electrum
+
+The node follows the chain through one of two sources:
+
+* **bitcoind's RPC** (`BITCOIND_RPC`, with a cookie or a user and password).
+* **An Electrum server** (`ELECTRUM_URL=tcp://host:50001` or `ssl://…`),
+  such as electrs or Fulcrum over your own Bitcoin Core. No RPC credentials
+  are needed, and one server can serve many mints. `ELECTRUM_SYNC_SECS` sets
+  how often the node polls it (at least 10). The default is ldk-node's: 80 s
+  for the wallet and 30 s for channels.
+
+Set one of the two. With neither, the mint runs without a node.
 
 ### Inbound liquidity: bootstrapping a channel
 
@@ -210,7 +224,7 @@ On NixOS, run it as a hardened systemd service next to nixpkgs' bitcoind:
 
 ```nix
 {
-  inputs.lnurl-mint.url = "github:dni/lnurl-mint-rust";
+  inputs.lnurl-mint.url = "github:lnurlcash/lnurl-mint-rust";
 
   outputs = { nixpkgs, lnurl-mint, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
@@ -395,7 +409,9 @@ byte-identical to LDK's own `signmessage`.
 
 The money paths run end to end on regtest, with a real bitcoind and mint
 processes: A under test, B paying and being paid and acting as an LSPS2
-provider, C unreachable, F fresh, D on its own cookie-authenticated bitcoind.
+provider, C unreachable, F fresh, D on its own cookie-authenticated bitcoind,
+and E syncing from electrs alone (`ELECTRS=docker:<image>` or a binary path;
+`make e2e` and CI use electrs 0.10.10, pinned by digest).
 B's LSP needs a build with `--features test-lsp`, which `make e2e` does:
 
 ```sh
@@ -414,6 +430,8 @@ make e2e BITCOIN_BIN=/path/to/bitcoin-31.1/bin
 * a restart with reconnection;
 * a crash between reserving a melt's notes and sending it: once a channel is
   usable again the melt is sent, the payee paid once, and the note burned;
+* Electrum: E, on electrs alone, sees its wallet funded, opens a channel to B
+  and accepts one, mints a note B pays for and melts it back;
 * a SIGKILL mid-melt: the note burns exactly when the payee was paid, and a
   force-closed channel's funds are swept back;
 * bitcoind restarting with a new cookie under a running mint that

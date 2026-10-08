@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ldk_node::{
     Builder, Node, NodeError,
     bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256},
-    config::Config as LdkConfig,
+    config::{BackgroundSyncConfig, Config as LdkConfig, ElectrumSyncConfig},
     lightning::{
         ln::{channelmanager::PaymentId, msgs::SocketAddress, types::ChannelId},
         routing::router::RouteParametersConfig,
@@ -160,12 +160,23 @@ pub struct LspConfig {
     pub token: Option<String>,
 }
 
+/// Where the node learns about the chain.
+#[derive(Debug, Clone)]
+pub enum ChainSource {
+    /// bitcoind's RPC.
+    Bitcoind(BitcoindConfig),
+    /// An Electrum server (electrs, Fulcrum), `tcp://host:port` or
+    /// `ssl://host:port`, polled every `sync_secs` (ldk-node's defaults when
+    /// `None`). Many nodes can share one in front of one bitcoind.
+    Electrum { url: String, sync_secs: Option<u64> },
+}
+
 /// Everything the node is started with.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub network: Network,
-    pub bitcoind: BitcoindConfig,
+    pub chain: ChainSource,
     /// Where peers connect to this node.
     pub listen: SocketAddr,
     /// The alias announced with public channels.
@@ -267,7 +278,6 @@ impl Ln {
 
     pub async fn start(config: NodeConfig, store: Arc<NoteStore>) -> Result<Self> {
         let seed = seed::Seed::load_or_create(&config.data_dir.join("seed"))?;
-        let (rpc_user, rpc_password) = config.bitcoind.credentials()?;
 
         let mut ldk_config = LdkConfig {
             network: config.network.bitcoin(),
@@ -294,13 +304,28 @@ impl Ln {
                     .join("ldk-node")
                     .to_string_lossy()
                     .into_owned(),
-            )
-            .set_chain_source_bitcoind_rpc(
-                config.bitcoind.host.clone(),
-                config.bitcoind.port,
-                rpc_user,
-                rpc_password,
             );
+        match &config.chain {
+            ChainSource::Bitcoind(bitcoind) => {
+                let (rpc_user, rpc_password) = bitcoind.credentials()?;
+                builder.set_chain_source_bitcoind_rpc(
+                    bitcoind.host.clone(),
+                    bitcoind.port,
+                    rpc_user,
+                    rpc_password,
+                );
+            }
+            ChainSource::Electrum { url, sync_secs } => {
+                let sync_config = sync_secs.map(|secs| ElectrumSyncConfig {
+                    background_sync_config: Some(BackgroundSyncConfig {
+                        onchain_wallet_sync_interval_secs: secs,
+                        lightning_wallet_sync_interval_secs: secs,
+                        ..Default::default()
+                    }),
+                });
+                builder.set_chain_source_electrum(url.clone(), sync_config);
+            }
+        }
         builder
             .set_listening_addresses(vec![SocketAddress::from(config.listen)])
             .map_err(|e| anyhow!("LN_LISTEN: {e:?}"))?;
@@ -333,10 +358,14 @@ impl Ln {
             .map_err(|e| anyhow!("could not start the node: {e}"))?;
         tokio::spawn(events::run(Arc::clone(&node), store, seed.preimages()));
         log::info!(
-            "Lightning node {} on {:?}, listening on {}{}",
+            "Lightning node {} on {:?}, listening on {}, chain from {}{}",
             node.node_id(),
             config.network,
             config.listen,
+            match &config.chain {
+                ChainSource::Bitcoind(b) => format!("bitcoind at {}:{}", b.host, b.port),
+                ChainSource::Electrum { url, .. } => format!("Electrum at {url}"),
+            },
             config
                 .lsp
                 .as_ref()
