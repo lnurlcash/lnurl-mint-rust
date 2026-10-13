@@ -17,7 +17,13 @@ pub(super) async fn run(node: Arc<Node>, store: Arc<NoteStore>, preimage_key: [u
     loop {
         let event = node.next_event_async().await;
         loop {
-            match handle(&node, &store, &preimage_key, &event) {
+            let (node, store, taken) = (Arc::clone(&node), Arc::clone(&store), event.clone());
+            // the store and the node's claim block: off the async workers
+            let handled =
+                tokio::task::spawn_blocking(move || handle(&node, &store, &preimage_key, &taken))
+                    .await
+                    .unwrap_or_else(|e| Err(e.into()));
+            match handled {
                 Ok(()) => break,
                 Err(e) => {
                     log::error!("could not record {event:?}: {e:#}; retrying");

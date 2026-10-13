@@ -139,11 +139,16 @@ async fn main() -> anyhow::Result<()> {
     let reconciler_state = state.clone();
     tokio::spawn(async move {
         loop {
-            if reconciler_state.ln.ready().is_ok() {
-                if let Err(e) = reconciler_state.reconcile_pending_melts() {
-                    log::warn!("reconciling pending melts failed: {}", e.reason());
+            let state = reconciler_state.clone();
+            // the store and the node block: off the async workers
+            let _ = tokio::task::spawn_blocking(move || {
+                if state.ln.ready().is_ok() {
+                    if let Err(e) = state.reconcile_pending_melts() {
+                        log::warn!("reconciling pending melts failed: {}", e.reason());
+                    }
                 }
-            }
+            })
+            .await;
             tokio::time::sleep(RECONCILE_INTERVAL).await;
         }
     });

@@ -126,7 +126,19 @@ fn refused(err: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, format!("{err:#}"))
 }
 
+/// Run `f` on the blocking pool: the store and the node block, and must not
+/// hold an async worker the LNURL endpoints and the node itself run on.
+async fn blocking(f: impl FnOnce() -> AdminResult + std::marker::Send + 'static) -> AdminResult {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(internal(e)))
+}
+
 async fn info(State(state): State<AppState>) -> AdminResult {
+    blocking(move || info_now(&state)).await
+}
+
+fn info_now(state: &AppState) -> AdminResult {
     let s = &state.settings;
     let (base, host) = s.public_base_url_and_host(None);
     Ok(Json(json!({
@@ -151,7 +163,11 @@ async fn info(State(state): State<AppState>) -> AdminResult {
 }
 
 async fn note(State(state): State<AppState>, Path(note): Path<String>) -> AdminResult {
-    let note_id = spend::note_id_of_ref(&note).ok_or((
+    blocking(move || note_now(&state, &note)).await
+}
+
+fn note_now(state: &AppState, note: &str) -> AdminResult {
+    let note_id = spend::note_id_of_ref(note).ok_or((
         StatusCode::BAD_REQUEST,
         "not a cp1 or a bearer note's hash".to_string(),
     ))?;
@@ -178,18 +194,28 @@ async fn note(State(state): State<AppState>, Path(note): Path<String>) -> AdminR
 }
 
 async fn pending(State(state): State<AppState>) -> AdminResult {
-    let melts = state.store.pending_melts().map_err(internal)?;
-    Ok(Json(json!({"pending_melts": melts})))
+    blocking(move || {
+        let melts = state.store.pending_melts().map_err(internal)?;
+        Ok(Json(json!({"pending_melts": melts})))
+    })
+    .await
 }
 
 async fn reconcile(State(state): State<AppState>) -> AdminResult {
-    state
-        .reconcile_pending_melts()
-        .map(Json)
-        .map_err(|e| internal(e.reason()))
+    blocking(move || {
+        state
+            .reconcile_pending_melts()
+            .map(Json)
+            .map_err(|e| internal(e.reason()))
+    })
+    .await
 }
 
 async fn users(State(state): State<AppState>) -> AdminResult {
+    blocking(move || users_now(&state)).await
+}
+
+fn users_now(state: &AppState) -> AdminResult {
     let users: Vec<Value> = state
         .store
         .list_usernames()
@@ -209,16 +235,19 @@ async fn users(State(state): State<AppState>) -> AdminResult {
 // ---- the node ----
 
 async fn balance(State(state): State<AppState>) -> AdminResult {
-    state.ln.balance().map(Json).map_err(refused)
+    blocking(move || state.ln.balance().map(Json).map_err(refused)).await
 }
 
 async fn new_address(State(state): State<AppState>) -> AdminResult {
-    let address = state.ln.new_address().map_err(refused)?;
-    Ok(Json(json!({"address": address})))
+    blocking(move || {
+        let address = state.ln.new_address().map_err(refused)?;
+        Ok(Json(json!({"address": address})))
+    })
+    .await
 }
 
 async fn peers(State(state): State<AppState>) -> AdminResult {
-    state.ln.peers().map(Json).map_err(refused)
+    blocking(move || state.ln.peers().map(Json).map_err(refused)).await
 }
 
 #[derive(Deserialize)]
@@ -233,7 +262,7 @@ async fn connect(State(state): State<AppState>, Json(req): Json<Connect>) -> Adm
 }
 
 async fn channels(State(state): State<AppState>) -> AdminResult {
-    state.ln.channels().map(Json).map_err(refused)
+    blocking(move || state.ln.channels().map(Json).map_err(refused)).await
 }
 
 #[derive(Deserialize)]
@@ -265,11 +294,14 @@ async fn close_channel(
     State(state): State<AppState>,
     Json(req): Json<CloseChannel>,
 ) -> AdminResult {
-    state
-        .ln
-        .close_channel(&req.channel_id, req.force)
-        .map_err(refused)?;
-    Ok(Json(json!({"status": "closing"})))
+    blocking(move || {
+        state
+            .ln
+            .close_channel(&req.channel_id, req.force)
+            .map_err(refused)?;
+        Ok(Json(json!({"status": "closing"})))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -282,13 +314,16 @@ struct NewInvoice {
 /// An invoice paying the node itself, crediting no note: to take in
 /// liquidity, or to test a route.
 async fn invoice(State(state): State<AppState>, Json(req): Json<NewInvoice>) -> AdminResult {
-    let invoice = state
-        .ln
-        .operator_invoice(req.amount_msat, &req.description)
-        .map_err(refused)?;
-    Ok(Json(
-        json!({"bolt11": invoice.bolt11, "payment_hash": invoice.payment_hash}),
-    ))
+    blocking(move || {
+        let invoice = state
+            .ln
+            .operator_invoice(req.amount_msat, &req.description)
+            .map_err(refused)?;
+        Ok(Json(
+            json!({"bolt11": invoice.bolt11, "payment_hash": invoice.payment_hash}),
+        ))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -303,23 +338,29 @@ struct Bootstrap {
 /// A bootstrap invoice: paid from outside the mint, it has the LSP open the
 /// node's first inbound channel, keeping its fee from the payment.
 async fn bootstrap(State(state): State<AppState>, Json(req): Json<Bootstrap>) -> AdminResult {
-    let invoice = state
-        .ln
-        .bootstrap_invoice(req.amount_msat, &req.description, req.max_fee_msat)
-        .map_err(refused)?;
-    Ok(Json(
-        json!({"bolt11": invoice.bolt11, "payment_hash": invoice.payment_hash}),
-    ))
+    blocking(move || {
+        let invoice = state
+            .ln
+            .bootstrap_invoice(req.amount_msat, &req.description, req.max_fee_msat)
+            .map_err(refused)?;
+        Ok(Json(
+            json!({"bolt11": invoice.bolt11, "payment_hash": invoice.payment_hash}),
+        ))
+    })
+    .await
 }
 
 async fn invoice_status(
     State(state): State<AppState>,
     Path(payment_hash): Path<String>,
 ) -> AdminResult {
-    match state.ln.invoice_paid(&payment_hash).map_err(refused)? {
-        Some(paid) => Ok(Json(json!({"paid": paid}))),
-        None => Err((StatusCode::NOT_FOUND, "no such invoice".into())),
-    }
+    blocking(
+        move || match state.ln.invoice_paid(&payment_hash).map_err(refused)? {
+            Some(paid) => Ok(Json(json!({"paid": paid}))),
+            None => Err((StatusCode::NOT_FOUND, "no such invoice".into())),
+        },
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -331,6 +372,10 @@ struct Pay {
 /// Pay from the node's own liquidity. The outcome arrives later: poll
 /// `/node/payment/<hash>`.
 async fn pay(State(state): State<AppState>, Json(req): Json<Pay>) -> AdminResult {
+    blocking(move || pay_now(&state, &req)).await
+}
+
+fn pay_now(state: &AppState, req: &Pay) -> AdminResult {
     let invoice = state.ln.decode_invoice(&req.bolt11).map_err(refused)?;
     let amount = invoice
         .amount_msat
@@ -346,10 +391,13 @@ async fn pay(State(state): State<AppState>, Json(req): Json<Pay>) -> AdminResult
 }
 
 async fn payment(State(state): State<AppState>, Path(payment_hash): Path<String>) -> AdminResult {
-    let status = state.ln.payment_status(&payment_hash).map_err(refused)?;
-    Ok(Json(
-        json!({"status": format!("{status:?}").to_ascii_lowercase()}),
-    ))
+    blocking(move || {
+        let status = state.ln.payment_status(&payment_hash).map_err(refused)?;
+        Ok(Json(
+            json!({"status": format!("{status:?}").to_ascii_lowercase()}),
+        ))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -360,11 +408,14 @@ struct Send {
 }
 
 async fn send(State(state): State<AppState>, Json(req): Json<Send>) -> AdminResult {
-    let txid = state
-        .ln
-        .send_onchain(&req.address, req.amount_sat)
-        .map_err(refused)?;
-    Ok(Json(json!({"txid": txid})))
+    blocking(move || {
+        let txid = state
+            .ln
+            .send_onchain(&req.address, req.amount_sat)
+            .map_err(refused)?;
+        Ok(Json(json!({"txid": txid})))
+    })
+    .await
 }
 
 #[cfg(test)]

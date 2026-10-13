@@ -43,6 +43,19 @@ fn request_host(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::HOST).and_then(|h| h.to_str().ok())
 }
 
+fn owned_host(headers: &HeaderMap) -> Option<String> {
+    request_host(headers).map(str::to_string)
+}
+
+/// Run `f` on the blocking pool: the store's lock, SQLite's fsyncs, the node's
+/// calls and Bitcoin Core's interpreter must never hold an async worker, or
+/// every other request waits behind them.
+async fn blocking(f: impl FnOnce() -> MintResult<Value> + Send + 'static) -> MintResult<Value> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(MintError::Internal(e.into())))
+}
+
 /// The query as ordered pairs: `k1` repeats for a merge.
 fn query_pairs(query: Option<String>) -> Vec<(String, String)> {
     url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
@@ -76,7 +89,8 @@ async fn lnurlp(
     Path(username): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    respond(state.pay_request(&username, request_host(&headers)))
+    let host = owned_host(&headers);
+    respond(blocking(move || state.pay_request(&username, host.as_deref())).await)
 }
 
 async fn lnurlw(
@@ -84,12 +98,13 @@ async fn lnurlw(
     Path(username): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    respond(state.mint_address(&username, request_host(&headers)))
+    let host = owned_host(&headers);
+    respond(blocking(move || state.mint_address(&username, host.as_deref())).await)
 }
 
 async fn nostr_json(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
     let pairs = query_pairs(query);
-    respond(state.nip05(param(&pairs, "name")))
+    respond(blocking(move || state.nip05(param(&pairs, "name"))).await)
 }
 
 async fn pay_callback(
@@ -98,7 +113,8 @@ async fn pay_callback(
     headers: HeaderMap,
 ) -> Response {
     let pairs = query_pairs(query);
-    respond(pay(&state, None, &pairs, request_host(&headers)))
+    let host = owned_host(&headers);
+    respond(blocking(move || pay(&state, None, &pairs, host.as_deref())).await)
 }
 
 async fn pay_callback_for_username(
@@ -108,7 +124,8 @@ async fn pay_callback_for_username(
     headers: HeaderMap,
 ) -> Response {
     let pairs = query_pairs(query);
-    respond(pay(&state, Some(&username), &pairs, request_host(&headers)))
+    let host = owned_host(&headers);
+    respond(blocking(move || pay(&state, Some(&username), &pairs, host.as_deref())).await)
 }
 
 fn pay(
@@ -134,15 +151,19 @@ async fn register_username(
     headers: HeaderMap,
 ) -> Response {
     let pairs = query_pairs(query);
-    respond((|| {
-        state.register(
-            &username,
-            required(&pairs, "cx1")?,
-            required(&pairs, "sig")?,
-            param(&pairs, "npub"),
-            request_host(&headers),
-        )
-    })())
+    let host = owned_host(&headers);
+    respond(
+        blocking(move || {
+            state.register(
+                &username,
+                required(&pairs, "cx1")?,
+                required(&pairs, "sig")?,
+                param(&pairs, "npub"),
+                host.as_deref(),
+            )
+        })
+        .await,
+    )
 }
 
 async fn unregister_username(
@@ -152,14 +173,18 @@ async fn unregister_username(
     headers: HeaderMap,
 ) -> Response {
     let pairs = query_pairs(query);
+    let host = owned_host(&headers);
     respond(
-        required(&pairs, "sig")
-            .and_then(|sig| state.unregister(&username, sig, request_host(&headers))),
+        blocking(move || {
+            required(&pairs, "sig")
+                .and_then(|sig| state.unregister(&username, sig, host.as_deref()))
+        })
+        .await,
     )
 }
 
 async fn verify(State(state): State<AppState>, Path(payment_hash): Path<String>) -> Response {
-    respond(state.verify(&payment_hash.to_ascii_lowercase()))
+    respond(blocking(move || state.verify(&payment_hash.to_ascii_lowercase())).await)
 }
 
 async fn withdraw_request(
@@ -169,11 +194,13 @@ async fn withdraw_request(
 ) -> Response {
     // `amount` and `c` ride along on a note URL; they are ignored here
     let pairs = query_pairs(query);
-    respond(state.withdraw_request(
-        param(&pairs, "k1"),
-        param(&pairs, "p"),
-        request_host(&headers),
-    ))
+    let host = owned_host(&headers);
+    respond(
+        blocking(move || {
+            state.withdraw_request(param(&pairs, "k1"), param(&pairs, "p"), host.as_deref())
+        })
+        .await,
+    )
 }
 
 async fn withdraw_callback(
@@ -182,9 +209,8 @@ async fn withdraw_callback(
     headers: HeaderMap,
 ) -> Response {
     let pairs = query_pairs(query);
-    let host = request_host(&headers).map(str::to_string);
-    // every k1 is a run of Bitcoin Core's interpreter: off the async workers
-    let result = tokio::task::spawn_blocking(move || {
+    let host = owned_host(&headers);
+    let result = blocking(move || {
         if param(&pairs, "p").is_some() {
             return Err(MintError::Reject(
                 "p is only accepted at the informational endpoint.".into(),
@@ -204,8 +230,7 @@ async fn withdraw_callback(
             host.as_deref(),
         )
     })
-    .await
-    .unwrap_or_else(|e| Err(MintError::Internal(e.into())));
+    .await;
     respond(result)
 }
 
@@ -216,7 +241,13 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// A one-page frontend: the mint's Lightning Address and LNURL as a QR code.
+/// Two overlapping sheets: the copy button's icon.
+const COPY_ICON: &str = "<svg viewBox=\"0 0 24 24\" fill=none stroke=currentColor stroke-width=2 \
+     stroke-linecap=round stroke-linejoin=round aria-hidden=true><rect x=9 y=9 width=13 height=13 rx=\"2\"/>\
+     <path d=\"M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1\"/></svg>";
+
+/// A one-page frontend: the mint's Lightning Address and LNURL as a QR code,
+/// and the node's connection strings.
 async fn frontend(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let s = &state.settings;
     let (base, host) = s.public_base_url_and_host(request_host(&headers));
@@ -234,11 +265,31 @@ async fn frontend(State(state): State<AppState>, headers: HeaderMap) -> Response
                 .build()
         })
         .unwrap_or_default();
-    let outstanding = state
-        .store
-        .stats()
-        .map(|st| st.outstanding_msat / 1000)
-        .unwrap_or(0);
+    let blocking_state = state.clone();
+    let (outstanding, uris) = tokio::task::spawn_blocking(move || {
+        let outstanding = blocking_state
+            .store
+            .stats()
+            .map_or(0, |st| st.outstanding_msat / 1000);
+        (outstanding, blocking_state.ln.uris())
+    })
+    .await
+    .unwrap_or_default();
+    let node = if uris.is_empty() {
+        String::new()
+    } else {
+        let rows: String = uris
+            .iter()
+            .map(|uri| {
+                let uri = escape(uri);
+                format!(
+                    "<p class=uri><code>{uri}</code><button type=button class=copy \
+                     data-copy=\"{uri}\" title=Copy aria-label=\"Copy connection string\">{COPY_ICON}</button></p>"
+                )
+            })
+            .collect();
+        format!("<h2>Connect to the node</h2>{rows}")
+    };
     let fees = if s.has_fee() {
         format!(
             "{} msat + {} ppm per mint",
@@ -260,6 +311,9 @@ async fn frontend(State(state): State<AppState>, headers: HeaderMap) -> Response
 @media (prefers-color-scheme:dark){{:root{{--fg:#eee;--bg:#161616;--muted:#999}}}}
 body{{font:16px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg);max-width:36rem;margin:2rem auto;padding:0 16px}}
 .qr svg{{width:240px;height:240px;border-radius:8px}} code{{word-break:break-all}} .muted{{color:var(--muted)}} .warn{{color:#c33}}
+h2{{font-size:1.1rem;margin-top:2rem}} .uri{{display:flex;gap:.5rem;align-items:flex-start}}
+.copy{{flex:none;display:grid;place-items:center;width:2rem;height:2rem;padding:0;border:1px solid var(--muted);border-radius:6px;background:none;color:var(--fg);cursor:pointer}}
+.copy svg{{width:1rem;height:1rem}} .copy.done{{border-color:#2a2;color:#2a2}}
 </style></head><body>
 <h1>{title}</h1><p>{description}</p>{sunset}
 <p>Pay <b>{address}</b> from a wallet that can attach a LUD-12 comment to mint an
@@ -267,6 +321,21 @@ body{{font:16px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg);ma
 <div class=qr><a href="lightning:{lnurl}">{qr}</a></div>
 <p><code>{lnurl}</code></p>
 <p class=muted>Mint fee: {fees} &middot; Outstanding notes: {outstanding} sat</p>
+{node}
+<script>
+document.addEventListener('click', async (e) => {{
+  const b = e.target.closest('[data-copy]');
+  if (!b) return;
+  try {{
+    await navigator.clipboard.writeText(b.dataset.copy);
+    b.classList.add('done');
+    b.title = 'Copied';
+    setTimeout(() => {{ b.classList.remove('done'); b.title = 'Copy'; }}, 1500);
+  }} catch {{
+    getSelection().selectAllChildren(b.previousElementSibling);
+  }}
+}});
+</script>
 </body></html>"#,
         title = escape(&s.title),
         description = escape(&s.description),
@@ -603,5 +672,7 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("mint@mint.example"));
         assert!(html.contains("<svg"));
+        // no node, nothing to connect to
+        assert!(!html.contains("Connect to the node"));
     }
 }

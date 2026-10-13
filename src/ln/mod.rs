@@ -11,7 +11,13 @@
 mod events;
 mod seed;
 
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ldk_node::{
@@ -239,6 +245,10 @@ pub enum PayError {
 
 const NOT_RUNNING: &str = "the Lightning node is not running";
 
+/// How long the network graph's size is reused: counting it copies out every
+/// channel and node id, tens of thousands, under the graph's lock.
+const GRAPH_COUNT_TTL: Duration = Duration::from_secs(600);
+
 pub struct Ln {
     network: Network,
     node: Option<Arc<Node>>,
@@ -246,6 +256,8 @@ pub struct Ln {
     preimage_key: [u8; 32],
     lsp: Option<LspConfig>,
     rgs_url: Option<String>,
+    /// The graph's channel and node counts, and when they were taken.
+    graph_counts: Mutex<Option<(Instant, usize, usize)>>,
 }
 
 impl std::fmt::Debug for Ln {
@@ -273,6 +285,7 @@ impl Ln {
             preimage_key: [0; 32],
             lsp: None,
             rgs_url: None,
+            graph_counts: Mutex::new(None),
         }
     }
 
@@ -378,6 +391,7 @@ impl Ln {
             preimage_key: seed.preimages(),
             lsp: config.lsp,
             rgs_url: config.rgs_url,
+            graph_counts: Mutex::new(None),
         })
     }
 
@@ -517,6 +531,20 @@ impl Ln {
         signature_from_zbase32(&node.sign_message(message.as_bytes()))
     }
 
+    /// `pubkey@host:port` for every address the node announces: how a peer
+    /// connects to it. None without a node or announced addresses.
+    pub fn uris(&self) -> Vec<String> {
+        let Some(node) = &self.node else {
+            return vec![];
+        };
+        let id = node.node_id();
+        node.announcement_addresses()
+            .unwrap_or_default()
+            .iter()
+            .map(|a| format!("{id}@{a}"))
+            .collect()
+    }
+
     pub fn info(&self) -> Result<NodeInfo> {
         let node = self.node()?;
         let id = node.node_id().to_string();
@@ -547,10 +575,21 @@ impl Ln {
     /// What the node knows of the network, and its gossip and LSP sources.
     pub fn graph(&self) -> Result<Value> {
         let node = self.node()?;
-        let graph = node.network_graph();
+        let (channels, nodes) = {
+            let mut cached = self.graph_counts.lock().unwrap_or_else(|e| e.into_inner());
+            match *cached {
+                Some((at, channels, nodes)) if at.elapsed() < GRAPH_COUNT_TTL => (channels, nodes),
+                _ => {
+                    let graph = node.network_graph();
+                    let counts = (graph.list_channels().len(), graph.list_nodes().len());
+                    *cached = Some((Instant::now(), counts.0, counts.1));
+                    counts
+                }
+            }
+        };
         Ok(json!({
-            "channels": graph.list_channels().len(),
-            "nodes": graph.list_nodes().len(),
+            "channels": channels,
+            "nodes": nodes,
             "rapid_gossip_sync": self.rgs_url,
             "last_rapid_sync": node.status().latest_rgs_snapshot_timestamp,
             "lsp": self.lsp.as_ref().map(|l| format!("{}@{}", l.node_id, l.address)),

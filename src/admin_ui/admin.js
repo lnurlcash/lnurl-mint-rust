@@ -684,23 +684,31 @@ async function notesView() {
 const views = {overview, channels: channelsView, payments: paymentsView, wallet: walletView, notes: notesView};
 let current = 'overview';
 let refreshTimer = null;
+// bumped by every render: one overtaken by a newer render (a tab clicked
+// before the last one answered) drops its result and schedules nothing, so
+// refresh loops never pile up and a slow answer never paints the wrong tab
+let renderGeneration = 0;
 
 async function render() {
   clearTimeout(refreshTimer);
+  const generation = ++renderGeneration;
+  const tab = current;
   for (const t of document.querySelectorAll('[role=tab]')) {
-    t.setAttribute('aria-selected', String(t.dataset.tab === current));
+    t.setAttribute('aria-selected', String(t.dataset.tab === tab));
   }
   const view = $('#view');
+  let content;
   try {
-    const content = await views[current]();
-    view.replaceChildren(...content);
+    content = await views[tab]();
   } catch (err) {
     if (err instanceof SignedOut) return;
-    view.replaceChildren(card('Error', h('p', {class: 'error'}, err.message || String(err))));
+    content = [card('Error', h('p', {class: 'error'}, err.message || String(err)))];
   }
+  if (generation !== renderGeneration) return;
+  view.replaceChildren(...content);
   updateHeader();
   // the overview keeps itself current; forms elsewhere would lose input
-  if (current === 'overview') refreshTimer = setTimeout(render, 15000);
+  if (tab === 'overview') refreshTimer = setTimeout(render, 15000);
 }
 
 async function updateHeader() {
@@ -716,6 +724,7 @@ async function updateHeader() {
 
 function showLogin() {
   clearTimeout(refreshTimer);
+  renderGeneration++;
   $('#app').hidden = true;
   $('#login').hidden = false;
   $('#token').focus();
