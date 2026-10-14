@@ -269,6 +269,20 @@ impl std::fmt::Debug for Ln {
     }
 }
 
+/// The node's own runtime, apart from the one serving HTTP: ldk-node's chain
+/// polling, gossip and persistence can hold a worker for long stretches, and
+/// on the shared runtime every request, even a 404, queued behind them. Its
+/// threads are named `ldk-worker`, so `top -H` tells the two apart. Lives as
+/// long as the process (leaked): a runtime may not be dropped from async code.
+fn node_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("ldk-worker")
+        .enable_all()
+        .build()
+        .context("could not start the node's runtime")?;
+    Ok(Box::leak(Box::new(rt)))
+}
+
 fn hash32(hex_hash: &str) -> Result<[u8; 32]> {
     hex::decode(hex_hash)
         .ok()
@@ -306,9 +320,10 @@ impl Ln {
                 anchors.trusted_peers_no_reserve.push(lsp.node_id);
             }
         }
+        let runtime = node_runtime()?;
         let mut builder = Builder::from_config(ldk_config);
         builder
-            .set_runtime(tokio::runtime::Handle::current())
+            .set_runtime(runtime.handle().clone())
             .set_log_facade_logger()
             .set_entropy_seed_bytes(seed.node())
             .set_storage_dir_path(
@@ -369,7 +384,7 @@ impl Ln {
         // ldk-node blocks on the runtime it was given: off this worker
         tokio::task::block_in_place(|| node.start())
             .map_err(|e| anyhow!("could not start the node: {e}"))?;
-        tokio::spawn(events::run(Arc::clone(&node), store, seed.preimages()));
+        runtime.spawn(events::run(Arc::clone(&node), store, seed.preimages()));
         log::info!(
             "Lightning node {} on {:?}, listening on {}, chain from {}{}",
             node.node_id(),
@@ -560,11 +575,12 @@ impl Ln {
             color: None,
             num_peers: Some(node.list_peers().iter().filter(|p| p.is_connected).count() as u64),
             num_channels: Some(channels.iter().filter(|c| c.is_usable).count() as u64),
-            // only what the network already sees: announced channels
+            // the same channels as `num_channels`, private ones included: a
+            // mint's first channel, from its LSP, is never announced
             capacity_msat: Some(
                 channels
                     .iter()
-                    .filter(|c| c.is_announced)
+                    .filter(|c| c.is_usable)
                     .map(|c| c.channel_value_sats * 1000)
                     .sum(),
             ),
