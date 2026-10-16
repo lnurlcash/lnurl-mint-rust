@@ -190,17 +190,16 @@ function nodeDown(err) {
 
 // ---- views ----
 
-async function overview() {
-  const info = await api('info');
-  let balance = null,
-    channels = null,
-    nodeError = null;
-  try {
-    [balance, channels] = await Promise.all([api('node/balance'), api('node/channels')]);
-  } catch (err) {
-    if (err instanceof SignedOut) throw err;
-    nodeError = err;
-  }
+async function overview(infoRequest) {
+  // all three at once: one round trip, not three
+  const nodeRequest = Promise.all([api('node/balance'), api('node/channels')]).then(
+    (answers) => ({answers}),
+    (err) => ({err}),
+  );
+  const [info, node] = await Promise.all([infoRequest, nodeRequest]);
+  if (node.err instanceof SignedOut) throw node.err;
+  const [balance, channels] = node.answers ?? [null, null];
+  const nodeError = node.err ?? null;
   const st = info.stats;
   const outbound = balance?.lightning.outbound_msat ?? 0;
   const coverage = st.outstanding_msat > 0 ? Math.floor((outbound / st.outstanding_msat) * 100) : null;
@@ -697,23 +696,38 @@ async function render() {
     t.setAttribute('aria-selected', String(t.dataset.tab === tab));
   }
   const view = $('#view');
+  // a tab switch shows at once that it is under way; a refresh of the
+  // same tab just swaps the content when it arrives
+  if (view.dataset.tab !== tab) view.setAttribute('aria-busy', 'true');
+  // one info request per render, alongside the view's own: the header
+  // needs it, and so does the overview
+  const infoRequest = api('info');
+  infoRequest.catch(() => {}); // a view that never awaits it must not leave it unhandled
   let content;
   try {
-    content = await views[tab]();
+    content = await views[tab](infoRequest);
   } catch (err) {
     if (err instanceof SignedOut) return;
     content = [card('Error', h('p', {class: 'error'}, err.message || String(err)))];
   }
   if (generation !== renderGeneration) return;
+  await updateHeader(infoRequest);
+  if (generation !== renderGeneration) return;
   view.replaceChildren(...content);
-  updateHeader();
-  // the overview keeps itself current; forms elsewhere would lose input
-  if (tab === 'overview') refreshTimer = setTimeout(render, 15000);
+  view.dataset.tab = tab;
+  view.removeAttribute('aria-busy');
+  scheduleRefresh();
 }
 
-async function updateHeader() {
+/** The overview keeps itself current while it is on screen; forms elsewhere would lose input. */
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  if (current === 'overview' && !document.hidden) refreshTimer = setTimeout(render, 15000);
+}
+
+async function updateHeader(infoRequest) {
   try {
-    const info = await api('info');
+    const info = await infoRequest;
     $('#title').textContent = info.lightning_address;
     $('#subtitle').textContent = info.lightning === 'ready' ? '' : info.lightning;
     $('#status-dot').className = `dot ${info.lightning === 'ready' ? 'ok' : 'warn'}`;
@@ -767,6 +781,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     t.addEventListener('click', () => selectTab(t.dataset.tab));
   }
   window.addEventListener('hashchange', () => selectTab(location.hash.slice(1)));
+  // no polling from a background tab; back in view, the overview catches up
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearTimeout(refreshTimer);
+    else if (!$('#app').hidden && current === 'overview') render();
+  });
   current = views[location.hash.slice(1)] ? location.hash.slice(1) : 'overview';
 
   // already signed in?

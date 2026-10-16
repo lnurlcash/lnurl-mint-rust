@@ -181,6 +181,12 @@ p.warn {
   display: grid;
   gap: 16px;
 }
+/* a tab switch waiting on the mint: the previous tab dims until it answers */
+.view[aria-busy="true"] {
+  opacity: 0.5;
+  pointer-events: none;
+  transition: opacity 0.15s ease 0.1s;
+}
 .grid {
   display: grid;
   gap: 16px;
