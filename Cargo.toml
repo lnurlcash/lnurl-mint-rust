@@ -29,7 +29,7 @@ log = "0.4"
 # there, so the versions always agree.
 ldk-node = "0.7"
 
-lnurlcash-core = "0.2.3"
+lnurlcash-core = "0.2.4"
 # Bitcoin Core's script interpreter, built from source and linked statically
 lnurlcash-kernel = "0.2.3"
 # the versions lnurlcash-core uses. LDK brings its own secp256k1 0.29: the two
