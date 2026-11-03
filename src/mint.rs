@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     db::{self, StoreError},
-    ln::{PayError, PayStatus},
+    ln::{INVOICE_EXPIRY_SECS, PayError, PayStatus},
     spend,
     state::AppState,
 };
@@ -134,7 +134,7 @@ impl Share {
         }
     }
 
-    fn of(cx1: &Cx1) -> String {
+    pub(crate) fn of(cx1: &Cx1) -> String {
         hex::encode([&cx1.chain_code[..], &cx1.pubkey[..]].concat())
     }
 
@@ -253,14 +253,10 @@ impl AppState {
             ]),
             json!(["text/identifier", format!("{username}@{host}")]),
         ];
-        if self.settings.has_fee() {
-            entries.push(json!([
-                "text/plain",
-                format!(
-                    "Mint fees: {},{}",
-                    self.settings.base_fee_msat, self.settings.fee_percent_ppm
-                )
-            ]));
+        // LUD-26 has a wallet read the address fee at mint@<domain>, the
+        // mint's own payRequest, before it registers
+        if let Some(fees) = self.settings.fees_entry(self.is_own_username(username)) {
+            entries.push(json!(["text/plain", fees]));
         }
         Ok(Value::Array(entries).to_string())
     }
@@ -459,6 +455,14 @@ impl AppState {
                     _ => None,
                 },
                 "pr": pr,
+            })));
+        }
+        if let Some(fee) = self.store.address_fee(payment_hash)? {
+            return Ok(compact(json!({
+                "status": "OK",
+                "settled": fee.paid,
+                "preimage": fee.paid.then(|| hex::encode(self.ln.mint_preimage(&fee.label))),
+                "pr": fee.pr,
             })));
         }
         if let Some(pr) = self.store.melt_pr(payment_hash)? {
@@ -675,11 +679,28 @@ impl AppState {
         total: u64,
         request_host: Option<&str>,
     ) -> MintResult<Value> {
+        let decoded = self.ln.decode_invoice(pr);
+        // this mint's own address fee invoice: settled here, no payment
+        // leaves (LUD-26 lets a wallet melt a note it holds into it)
+        if let Ok(d) = &decoded {
+            if let Some(fee) = self.store.address_fee(&d.payment_hash)? {
+                if fee.pr.eq_ignore_ascii_case(pr.trim()) {
+                    return self.melt_into_address_fee(
+                        &note_ids,
+                        pr,
+                        d.amount_msat,
+                        total,
+                        &fee,
+                        request_host,
+                    );
+                }
+            }
+        }
         if let Err(e) = self.ln.ready() {
             log::warn!("refusing a melt: {e:#}");
             return reject("Melting is temporarily unavailable.");
         }
-        let decoded = match self.ln.decode_invoice(pr) {
+        let decoded = match decoded {
             Ok(d) => d,
             Err(e) => return reject(format!("Invalid invoice: {e}")),
         };
@@ -721,6 +742,40 @@ impl AppState {
             "status": "OK",
             "pr": self.settings.verify_enabled.then_some(pr),
             "verify": self.settings.verify_enabled.then(|| format!("{base}/verify/{hash}")),
+        })))
+    }
+
+    /// A melt into this mint's own address fee invoice: the notes are
+    /// burned and the held username registered at once, with nothing to
+    /// route. Its answer is a melt's, `verify` included.
+    fn melt_into_address_fee(
+        &self,
+        note_ids: &[String],
+        pr: &str,
+        invoice_msat: Option<u64>,
+        total: u64,
+        fee: &db::AddressFee,
+        request_host: Option<&str>,
+    ) -> MintResult<Value> {
+        if invoice_msat != Some(total) {
+            return reject(format!("Invoice must be for exactly {total} msat."));
+        }
+        let username = self
+            .store
+            .pay_address_fee_with_notes(note_ids, &fee.payment_hash, total)?;
+        log::info!(
+            "REGISTER {username} (address fee {total} msat paid with {} note(s), {})",
+            note_ids.len(),
+            fee.payment_hash
+        );
+        let (base, _) = self.settings.public_base_url_and_host(request_host);
+        Ok(compact(json!({
+            "status": "OK",
+            "pr": self.settings.verify_enabled.then_some(pr),
+            "verify": self
+                .settings
+                .verify_enabled
+                .then(|| format!("{base}/verify/{}", fee.payment_hash)),
         })))
     }
 
@@ -869,13 +924,50 @@ impl AppState {
         ) {
             return reject("Invalid ownership signature.");
         }
-        self.store.register_username(
+        let xp = hex::encode(share.pubkey_x_only());
+        let fee = self.settings.address_fee();
+        if fee == 0 {
+            self.store.register_username(
+                &username,
+                &Share::of(&share),
+                &xp,
+                nostr_pubkey.as_deref(),
+            )?;
+            return Ok(json!({"status": "OK"}));
+        }
+        // LUD-26's address fee: the username is held for this registration
+        // until its invoice is paid, and released if it expires unpaid.
+        // A taken username is refused before an invoice exists for it.
+        if self.store.username_taken(&username)? {
+            return Err(StoreError::AlreadyRegistered.into());
+        }
+        if let Err(e) = self.ln.ready() {
+            log::warn!("refusing a registration: {e:#}");
+            return reject("Registration is temporarily unavailable.");
+        }
+        let (_, host) = self.settings.public_base_url_and_host(request_host);
+        // keys the invoice's preimage, as an address mint's label does
+        let label = format!("address-fee:{}", hex::encode(rand::random::<[u8; 16]>()));
+        let invoice = self
+            .ln
+            .create_address_fee_invoice(fee, &format!("Register {username}@{host}"), &label)
+            .map_err(MintError::Internal)?;
+        self.store.hold_username(
+            &invoice.payment_hash,
+            &invoice.bolt11,
             &username,
             &Share::of(&share),
-            &hex::encode(share.pubkey_x_only()),
+            &xp,
             nostr_pubkey.as_deref(),
+            fee,
+            &label,
+            db::now() + u64::from(INVOICE_EXPIRY_SECS),
         )?;
-        Ok(json!({"status": "OK"}))
+        log::info!(
+            "HOLD {username} for its address fee, {fee} msat ({})",
+            invoice.payment_hash
+        );
+        Ok(json!({"status": "OK", "pr": invoice.bolt11}))
     }
 
     /// `PUT /.well-known/lnurlp/<username>`: `cx1` (the new share), `sig` by

@@ -70,11 +70,23 @@ fn handle(node: &Node, store: &NoteStore, preimage_key: &[u8; 32], event: &Event
             ..
         } => {
             let hash = hex::encode(payment_hash.0);
-            match store.settle_mint(&hash, &crate::mint::share_note_id)? {
-                Some((note_id, value)) => {
-                    log::info!("MINT {note_id} {value} msat (paid {amount_msat} msat, {hash})")
+            if let Some((note_id, value)) = store.settle_mint(&hash, &crate::mint::share_note_id)? {
+                log::info!("MINT {note_id} {value} msat (paid {amount_msat} msat, {hash})")
+            } else if let Some(paid) = store.settle_address_fee(&hash)? {
+                if paid.registered {
+                    log::info!(
+                        "REGISTER {} (address fee {amount_msat} msat, {hash})",
+                        paid.username
+                    )
+                } else {
+                    log::warn!(
+                        "address fee {hash} for {} settled after its hold lapsed and the \
+                         username was taken: {amount_msat} msat kept, nothing registered",
+                        paid.username
+                    )
                 }
-                None => log::info!("received {amount_msat} msat to {hash}"),
+            } else {
+                log::info!("received {amount_msat} msat to {hash}")
             }
         }
         Event::PaymentSuccessful {

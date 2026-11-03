@@ -217,10 +217,8 @@ async function overview(infoRequest) {
           ['Base URL', info.base_url],
           info.onion_url ? ['Onion', info.onion_url] : null,
           ['Node id', info.mint_pubkey ? copyable(info.mint_pubkey, short(info.mint_pubkey)) : '–'],
-          [
-            'Fees',
-            info.base_fee_msat || info.fee_percent_ppm ? `${sat(info.base_fee_msat)} + ${info.fee_percent_ppm} ppm` : 'none',
-          ],
+          ['Fees', info.base_fee_msat || info.fee_ppm ? `${sat(info.base_fee_msat)} + ${info.fee_ppm} ppm` : 'none'],
+          ['Address fee', info.address_fee_msat ? `${sat(info.address_fee_msat)} per registration` : 'none'],
           ['Mintable', `${sat(info.min_sendable_msat)} – ${sat(info.max_sendable_msat)}`],
           ['Version', info.version],
           info.sunset_mint ? ['Sunset', h('span', {class: 'warn'}, 'minting and splitting refused')] : null,
@@ -235,7 +233,11 @@ async function overview(infoRequest) {
           stat('Pending melts', nf.format(st.pending_notes)),
           stat('Spent', nf.format(st.spent_notes)),
           stat('Unpaid mints', nf.format(st.unpaid_mints)),
-          stat('Usernames', nf.format(st.usernames)),
+          stat(
+            'Usernames',
+            nf.format(st.usernames),
+            st.held_usernames ? `${nf.format(st.held_usernames)} awaiting address fee` : undefined,
+          ),
         ),
       ),
       card(
@@ -583,7 +585,7 @@ async function walletView() {
 }
 
 async function notesView() {
-  const [{pending_melts: pending}, {users}] = await Promise.all([api('pending'), api('users')]);
+  const [{pending_melts: pending}, {users, held}] = await Promise.all([api('pending'), api('users')]);
   const lookupOut = h('div', {class: 'result'});
   const pendingRows = Object.entries(pending);
   return [
@@ -675,6 +677,39 @@ async function notesView() {
           )
         : h('p', {class: 'muted'}, 'No usernames registered.'),
     ),
+    held.length
+      ? card(
+          'Awaiting address fee',
+          h('p', {class: 'muted'}, 'Held for their registration until the fee invoice is paid, released if it expires.'),
+          h(
+            'table',
+            {},
+            h(
+              'thead',
+              {},
+              h(
+                'tr',
+                {},
+                ['Username', 'Fee', 'Payment hash', 'Expires'].map((t) => h('th', {}, t)),
+              ),
+            ),
+            h(
+              'tbody',
+              {},
+              held.map((u) =>
+                h(
+                  'tr',
+                  {},
+                  h('td', {}, u.username),
+                  h('td', {class: 'num'}, sat(u.amount_msat)),
+                  h('td', {}, copyable(u.payment_hash, short(u.payment_hash))),
+                  h('td', {}, new Date(u.expires_at * 1000).toLocaleTimeString()),
+                ),
+              ),
+            ),
+          ),
+        )
+      : null,
   ];
 }
 
@@ -713,7 +748,7 @@ async function render() {
   if (generation !== renderGeneration) return;
   await updateHeader(infoRequest);
   if (generation !== renderGeneration) return;
-  view.replaceChildren(...content);
+  view.replaceChildren(...content.filter(Boolean));
   view.dataset.tab = tab;
   view.removeAttribute('aria-busy');
   scheduleRefresh();

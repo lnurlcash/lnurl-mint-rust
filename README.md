@@ -271,7 +271,7 @@ user and password in an environment file.
 | | |
 |---|---|
 | `GET /.well-known/lnurlp/<username>` | LUD-16 payRequest with `withdrawLink`. `_`, `mint` and `USERNAME` are the mint itself; a registered username is an ordinary Lightning Address (`<username>+<tag>` too) with no `commentAllowed`. |
-| `POST /.well-known/lnurlp/<username>` | LUD-26 register, form body `cx1=&sig=[&npub=]`: `sig` by the share's own key. Never overwrites, and a share is never accepted twice. |
+| `POST /.well-known/lnurlp/<username>` | LUD-26 register, form body `cx1=&sig=[&npub=]`: `sig` by the share's own key. Never overwrites, and a share is never accepted twice. With `ADDRESS_FEE_MSAT` set, answers `{"status": "OK", "pr"}` and holds the username until that invoice is paid (from any wallet, or by melting a note of exactly the fee here), releasing it if the invoice expires unpaid. The fee is the third `Mint fees` value at `mint@`. |
 | `PUT /.well-known/lnurlp/<username>` | LUD-26 update to a new share, form body `cx1=&sig=&newsig=`: `sig` by the key on file, `newsig` by the new share. |
 | `DELETE /.well-known/lnurlp/<username>` | LUD-26 unregister, form body `sig=` by the key on file. |
 | `GET /p/cb?amount=&comment=` | Mint: `comment` is `cp1<Q>` or a bearer note's hex `h`. |
@@ -328,7 +328,7 @@ five tabs:
 * **Channels:** open, close and force-close channels; connect peers.
 * **Payments:** create invoices to receive liquidity, and pay invoices.
 * **Wallet:** balances, receive addresses with QR codes, on-chain sends.
-* **Notes:** pending melts and reconcile, note lookup, registered usernames.
+* **Notes:** pending melts and reconcile, note lookup, registered usernames and those waiting for their address fee.
 
 Signing in trades the token for a session cookie (`HttpOnly`,
 `SameSite=Strict`, 12 hours), so the page's script never holds a credential.
@@ -354,7 +354,7 @@ routes, without that check, are on the admin socket the CLI uses:
 | `GET /note/<cp1 or h>` | A note's status and value. |
 | `GET /pending` | Notes reserved by in-flight melts, by payment hash. |
 | `POST /reconcile` | Resolve pending melts now. |
-| `GET /users` | Registered usernames, their `cx1` (`legacy` for one registered before LUD-26) and next index. |
+| `GET /users` | Registered usernames, their `cx1` (`legacy` for one registered before LUD-26) and next index, and under `held` the usernames waiting for their address fee. |
 | `GET /node/balance` | On-chain and Lightning balances. |
 | `POST /node/address` | A fresh address to fund the wallet. |
 | `GET /node/peers`, `POST /node/peers` `{"peer": "pubkey@host:port"}` | List or connect peers. |

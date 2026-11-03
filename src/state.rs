@@ -44,7 +44,10 @@ pub struct Settings {
     pub min_sendable_msat: u64,
     pub max_sendable_msat: u64,
     pub base_fee_msat: u64,
-    pub fee_percent_ppm: u64,
+    pub fee_ppm: u64,
+    /// LUD-26's address fee: what registering a username costs, in msat.
+    /// 0 is free.
+    pub address_fee_msat: u64,
     /// Floor on a freshly minted note's value, net of the mint fee.
     pub min_mint_msat: u64,
     pub max_k1s: usize,
@@ -78,8 +81,8 @@ impl Settings {
         if self.min_sendable_msat == 0 || self.min_sendable_msat > self.max_sendable_msat {
             bail!("MIN_SENDABLE_MSAT must be in [1, MAX_SENDABLE_MSAT]");
         }
-        if self.fee_percent_ppm > 100_000 {
-            bail!("FEE_PERCENT_PPM is capped at 100000 (10%)");
+        if self.fee_ppm > 100_000 {
+            bail!("FEE_PPM is capped at 100000 (10%)");
         }
         if self.max_k1s == 0 {
             bail!("MAX_K1S must be at least 1");
@@ -124,8 +127,8 @@ impl Settings {
 
     /// The fee withheld from a mint of `amount_msat`, rounded up to a sat.
     pub fn mint_fee_msat(&self, amount_msat: u64) -> u64 {
-        let percent = (amount_msat / 1_000_000) * self.fee_percent_ppm
-            + ((amount_msat % 1_000_000) * self.fee_percent_ppm) / 1_000_000;
+        let percent = (amount_msat / 1_000_000) * self.fee_ppm
+            + ((amount_msat % 1_000_000) * self.fee_ppm) / 1_000_000;
         (self.base_fee_msat + percent).div_ceil(1000) * 1000
     }
 
@@ -154,7 +157,41 @@ impl Settings {
     }
 
     pub fn has_fee(&self) -> bool {
-        self.base_fee_msat != 0 || self.fee_percent_ppm != 0
+        self.base_fee_msat != 0 || self.fee_ppm != 0
+    }
+
+    /// The address fee a registration is charged: none while registration
+    /// is disabled.
+    pub fn address_fee(&self) -> u64 {
+        if self.username_registration_enabled {
+            self.address_fee_msat
+        } else {
+            0
+        }
+    }
+
+    /// LUD-25's `Mint fees: <base>,<ppm>`, with LUD-26's address fee as a
+    /// third value where `with_address_fee` (the mint's own payRequest).
+    /// `None` when there is nothing to announce.
+    pub fn fees_entry(&self, with_address_fee: bool) -> Option<String> {
+        let address_fee = if with_address_fee {
+            self.address_fee()
+        } else {
+            0
+        };
+        if address_fee != 0 {
+            Some(format!(
+                "Mint fees: {},{},{address_fee}",
+                self.base_fee_msat, self.fee_ppm
+            ))
+        } else if self.has_fee() {
+            Some(format!(
+                "Mint fees: {},{}",
+                self.base_fee_msat, self.fee_ppm
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -167,7 +204,8 @@ pub fn test_settings() -> Settings {
         min_sendable_msat: 10_000,
         max_sendable_msat: 1_000_000_000,
         base_fee_msat: 1000,
-        fee_percent_ppm: 2000,
+        fee_ppm: 2000,
+        address_fee_msat: 0,
         min_mint_msat: 10_000,
         max_k1s: 100,
         sunset_mint: false,
@@ -192,6 +230,26 @@ mod tests {
         // 1000 + 0.2% of 10_500 = 1021 -> 2000
         assert_eq!(s.mint_fee_msat(10_500), 2000);
         assert!(s.min_sendable() - s.mint_fee_msat(s.min_sendable()) >= s.min_mint_msat);
+    }
+
+    #[test]
+    fn the_address_fee_is_a_third_mint_fees_value() {
+        let mut s = test_settings();
+        assert_eq!(s.fees_entry(true).as_deref(), Some("Mint fees: 1000,2000"));
+        s.address_fee_msat = 21_000;
+        assert_eq!(
+            s.fees_entry(true).as_deref(),
+            Some("Mint fees: 1000,2000,21000")
+        );
+        assert_eq!(s.fees_entry(false).as_deref(), Some("Mint fees: 1000,2000"));
+        // an address fee alone is still announced
+        (s.base_fee_msat, s.fee_ppm) = (0, 0);
+        assert_eq!(s.fees_entry(true).as_deref(), Some("Mint fees: 0,0,21000"));
+        assert_eq!(s.fees_entry(false), None);
+        // registration disabled: nothing to charge for
+        s.username_registration_enabled = false;
+        assert_eq!(s.address_fee(), 0);
+        assert_eq!(s.fees_entry(true), None);
     }
 
     #[test]

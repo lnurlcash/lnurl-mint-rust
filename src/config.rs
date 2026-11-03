@@ -129,8 +129,12 @@ pub struct Config {
     pub base_fee_msat: u64,
 
     /// Proportional mint fee in parts per million (at most 100000).
-    #[arg(long, env = "FEE_PERCENT_PPM", default_value_t = 0)]
-    pub fee_percent_ppm: u64,
+    #[arg(long, env = "FEE_PPM", default_value_t = 0)]
+    pub fee_ppm: u64,
+
+    /// LUD-26 address fee in msat: what registering a username costs. 0 is free.
+    #[arg(long, env = "ADDRESS_FEE_MSAT", default_value_t = 0)]
+    pub address_fee_msat: u64,
 
     /// Smallest value a freshly minted note may have, net of fees.
     #[arg(long, env = "MIN_MINT_MSAT", default_value_t = 10_000)]
@@ -263,7 +267,8 @@ impl Config {
             min_sendable_msat: self.min_sendable_msat,
             max_sendable_msat: self.max_sendable_msat,
             base_fee_msat: self.base_fee_msat,
-            fee_percent_ppm: self.fee_percent_ppm,
+            fee_ppm: self.fee_ppm,
+            address_fee_msat: self.address_fee_msat,
             min_mint_msat: self.min_mint_msat,
             max_k1s: self.max_k1s,
             sunset_mint: self.sunset_mint,
