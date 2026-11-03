@@ -1,17 +1,21 @@
 //! LUD-25 and LUD-26, as lnurl-mint implements them: minting from a
 //! payRequest, the informational withdrawRequest, melt, rotate, split and
 //! merge at its callback, offline-verification certificates, and Lightning
-//! Address auto-mint onto a registered `cx1` branch.
+//! Addresses on a registered share's `cx1`: auto-mint, internal transfer and
+//! registration.
 //!
 //! Every function here answers in LUD-01's shape: success JSON, or a
 //! [`MintError`] the HTTP layer turns into `{"status": "ERROR", "reason"}`.
 
+use std::collections::HashSet;
+
 use lnurlcash_core::{
     recoverable::{
-        PURPOSE_LIGHTNING_ADDRESS, PURPOSE_WALLET, decode_cx1, derive_note_pubkey,
-        encode_cs1_with_amount, encode_cx1,
+        Cx1, LEGACY_PURPOSE_LIGHTNING_ADDRESS, LegacyCx1, decode_cx1, derive_note_pubkey,
+        encode_cs1_with_amount, encode_cx1, encode_legacy_cx1, legacy_derive_note_pubkey,
     },
     signature::{address_proof_digest, note_signature_message_for_hash},
+    spend::spend_domain_of,
 };
 use secp256k1::{XOnlyPublicKey, schnorr};
 use serde_json::{Map, Value, json};
@@ -74,11 +78,23 @@ fn compact(value: Value) -> Value {
 }
 
 /// A registrable username: short, lowercase, and never shaped like a note.
+/// `+` is never one of its characters, so `<username>+<tag>` is always the
+/// tag of a registered `<username>` (LUD-26).
 pub fn valid_username(username: &str) -> bool {
     (1..=32).contains(&username.len())
         && username
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+}
+
+/// The username a Lightning Address names: lowercase, any `+<tag>` dropped,
+/// since a tagged payment auto-mints into the untagged share like any other.
+fn address_name(username: &str) -> String {
+    let username = username.to_ascii_lowercase();
+    match username.split_once('+') {
+        Some((name, _)) => name.to_string(),
+        None => username,
+    }
 }
 
 fn decode_npub(npub: &str) -> Option<[u8; 32]> {
@@ -91,31 +107,84 @@ fn decode_npub(npub: &str) -> Option<[u8; 32]> {
     checked.byte_iter().collect::<Vec<u8>>().try_into().ok()
 }
 
-/// A cx1 as stored: `hex(P || chain_code)`.
-fn branch_parts(branch_hex: &str) -> Option<([u8; 32], [u8; 32])> {
-    let bytes = hex::decode(branch_hex).ok()?;
-    if bytes.len() != 64 {
-        return None;
-    }
-    Some((bytes[..32].try_into().ok()?, bytes[32..].try_into().ok()?))
+/// A share as it is on file. LUD-26's is `hex(chain code || P)`; a username
+/// registered before it holds `hex(x(P) || chain code)`, the superseded
+/// 64-byte `cx1`. Those keep auto-minting under the old purpose-2 tweak, so
+/// an address does not stop working the day the mint upgrades, until their
+/// owner moves them to a share with an update signed by the old key.
+pub(crate) enum Share {
+    Current(Cx1),
+    Legacy(LegacyCx1),
 }
 
-/// Does `sig` prove control of the branch's purpose-0 index-0 key, over
-/// `sha256("LNURLcash:<action>:<domain>:<username>")`?
-pub(crate) fn owns_branch(
+impl Share {
+    pub(crate) fn on_file(cx1_hex: &str) -> Option<Self> {
+        let bytes = hex::decode(cx1_hex).ok()?;
+        match bytes.len() {
+            65 => decode_cx1(&encode_cx1(&Cx1 {
+                chain_code: bytes[..32].try_into().ok()?,
+                pubkey: bytes[32..].try_into().ok()?,
+            }))
+            .map(Share::Current),
+            64 => Some(Share::Legacy(LegacyCx1 {
+                pubkey_x_only: bytes[..32].try_into().ok()?,
+                chain_code: bytes[32..].try_into().ok()?,
+            })),
+            _ => None,
+        }
+    }
+
+    fn of(cx1: &Cx1) -> String {
+        hex::encode([&cx1.chain_code[..], &cx1.pubkey[..]].concat())
+    }
+
+    /// `x(P)`: what the share's proofs verify against.
+    fn xp(&self) -> [u8; 32] {
+        match self {
+            Share::Current(cx1) => cx1.pubkey_x_only(),
+            Share::Legacy(cx1) => cx1.pubkey_x_only,
+        }
+    }
+
+    pub(crate) fn cx1(&self) -> String {
+        match self {
+            Share::Current(cx1) => encode_cx1(cx1),
+            Share::Legacy(cx1) => encode_legacy_cx1(cx1),
+        }
+    }
+
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self, Share::Legacy(_))
+    }
+
+    /// `hex(Q)` of the share's note `index`.
+    fn note_id(&self, index: u32) -> Option<String> {
+        match self {
+            Share::Current(cx1) => derive_note_pubkey(cx1, index).ok(),
+            Share::Legacy(cx1) => {
+                legacy_derive_note_pubkey(cx1, Some(LEGACY_PURPOSE_LIGHTNING_ADDRESS), index).ok()
+            }
+        }
+        .map(hex::encode)
+    }
+}
+
+/// The note `index` of the share on file, for the store to credit.
+pub(crate) fn share_note_id(cx1_hex: &str, index: u32) -> Option<String> {
+    Share::on_file(cx1_hex)?.note_id(index)
+}
+
+/// Does `sig` verify against `signer` (an `x(P)`), over this action's message
+/// for `domain`, `username` and, for register and update, `cx1`?
+pub(crate) fn proves(
     action: &str,
     domain: &str,
     username: &str,
-    branch_hex: &str,
+    cx1: Option<&str>,
+    signer: [u8; 32],
     sig: &str,
 ) -> bool {
-    let Some((point, chain_code)) = branch_parts(branch_hex) else {
-        return false;
-    };
-    let Ok(pk0) = derive_note_pubkey(&point, &chain_code, PURPOSE_WALLET, 0) else {
-        return false;
-    };
-    let Ok(digest) = address_proof_digest(action, domain, username) else {
+    let Ok(digest) = address_proof_digest(action, domain, username, cx1) else {
         return false;
     };
     let Some(sig) = hex::decode(sig.trim())
@@ -124,16 +193,28 @@ pub(crate) fn owns_branch(
     else {
         return false;
     };
-    let Ok(pk) = XOnlyPublicKey::from_byte_array(pk0) else {
+    let Ok(pk) = XOnlyPublicKey::from_byte_array(signer) else {
         return false;
     };
     schnorr::verify(&schnorr::Signature::from_byte_array(sig), &digest, &pk).is_ok()
 }
 
 impl AppState {
+    /// The mint's own address: `_`, its configured username, and always
+    /// `mint`, where LUD-26 has a wallet find the mint `payRequest` from the
+    /// domain alone.
     fn is_own_username(&self, username: &str) -> bool {
         let username = username.to_ascii_lowercase();
-        username == "_" || username == self.settings.username.to_ascii_lowercase()
+        username == "_"
+            || username == "mint"
+            || username == self.settings.username.to_ascii_lowercase()
+    }
+
+    /// The domain this request reached the mint at, which its certificates
+    /// and registration proofs name.
+    fn domain(&self, request_host: Option<&str>) -> String {
+        let (_, host) = self.settings.public_base_url_and_host(request_host);
+        spend_domain_of(&host).unwrap_or(host)
     }
 
     /// A registered username's branch, while registration is enabled.
@@ -148,10 +229,10 @@ impl AppState {
         self.ln.node_id()
     }
 
-    /// A `cs1` certificate over `(Q, amount)`, signed by this node. `None` if
-    /// signing failed: the mutation it belongs to still stands.
-    fn certificate(&self, note_id: &str, amount_msat: u64) -> Option<String> {
-        let message = note_signature_message_for_hash(note_id, amount_msat);
+    /// A `cs1` certificate over `(domain, Q, amount)`, signed by this node.
+    /// `None` if signing failed: the mutation it belongs to still stands.
+    fn certificate(&self, domain: &str, note_id: &str, amount_msat: u64) -> Option<String> {
+        let message = note_signature_message_for_hash(note_id, domain, amount_msat)?;
         match self.ln.sign_message(&message) {
             Ok(sig) => Some(encode_cs1_with_amount(amount_msat, &sig)),
             Err(e) => {
@@ -172,17 +253,6 @@ impl AppState {
             ]),
             json!(["text/identifier", format!("{username}@{host}")]),
         ];
-        if !self.is_own_username(username) {
-            if let Some(branch_hex) = self.registered_branch(username)? {
-                let (point, chain_code) = branch_parts(&branch_hex)
-                    .ok_or_else(|| MintError::Internal(anyhow::anyhow!("corrupt cx1 on file")))?;
-                let hint = self.store.next_index_hint(username)?.unwrap_or(0);
-                entries.push(json!([
-                    "text/cpub",
-                    format!("{}:{hint}", encode_cx1(&point, &chain_code))
-                ]));
-            }
-        }
         if self.settings.has_fee() {
             entries.push(json!([
                 "text/plain",
@@ -197,10 +267,10 @@ impl AppState {
 
     /// `GET /.well-known/lnurlp/<username>`: LUD-16 payRequest that mints a note.
     pub fn pay_request(&self, username: &str, request_host: Option<&str>) -> MintResult<Value> {
-        let username = username.to_ascii_lowercase();
+        let username = address_name(username);
         let own = self.is_own_username(&username);
         if !own && self.registered_branch(&username)?.is_none() {
-            return reject("Unknown user.");
+            return reject("unknown user");
         }
         let (base, host) = self.settings.public_base_url_and_host(request_host);
         // the fixed identity always names itself by its canonical username, so
@@ -222,14 +292,15 @@ impl AppState {
             "maxSendable": self.settings.max_sendable_msat,
             "metadata": self.pay_metadata(&name, &host)?,
             "withdrawLink": format!("{base}/w"),
-            // a registered address always mints onto its own branch
+            // a registered address always mints onto its own share, so a
+            // comment could never reach its holder (LUD-26)
             "commentAllowed": if own { Some(64) } else { None },
         })))
     }
 
     /// `GET /p/cb` and `GET /p/<username>`: an invoice that, once paid, credits
-    /// the note named by `comment` (fixed identity) or the next key on the
-    /// username's branch (LUD-26 auto-mint).
+    /// the note named by `comment` (fixed identity) or the next unused note
+    /// of the username's share, picked when it settles (LUD-26 auto-mint).
     pub fn pay_callback(
         &self,
         username: Option<&str>,
@@ -241,14 +312,16 @@ impl AppState {
         if s.sunset_mint {
             return reject("This mint is sunsetting - minting is disabled.");
         }
-        let username = username.map(str::to_ascii_lowercase);
-        let branch = match &username {
-            Some(name) => match self.registered_branch(name)? {
-                Some(branch) => Some(branch),
-                None => return reject("Unknown user."),
-            },
-            None => None,
+        let username = username.map(address_name);
+        let username = match username {
+            Some(name) if self.is_own_username(&name) => None,
+            other => other,
         };
+        if let Some(name) = &username {
+            if self.registered_branch(name)?.is_none() {
+                return reject("unknown user");
+            }
+        }
         if amount < s.min_sendable_msat {
             return reject("Amount too low.");
         }
@@ -268,50 +341,105 @@ impl AppState {
             .unwrap_or_else(|| s.username.to_ascii_lowercase());
         let metadata = self.pay_metadata(&name, &host)?;
 
-        let note_id = match (&branch, &username) {
-            (Some(branch_hex), Some(name)) => {
-                let (point, chain_code) = branch_parts(branch_hex)
-                    .ok_or_else(|| MintError::Internal(anyhow::anyhow!("corrupt cx1 on file")))?;
-                self.store
-                    .claim_next_index(name, |i| {
-                        derive_note_pubkey(&point, &chain_code, PURPOSE_LIGHTNING_ADDRESS, i)
-                            .ok()
-                            .map(hex::encode)
-                    })?
-                    .0
-            }
-            _ => match comment.and_then(spend::note_id_of_ref) {
-                Some(id) => id,
-                None => {
-                    return reject(
-                        "Missing or malformed comment: a cp1<Q>, or a bearer note's \
-                         hex-encoded 32-byte hash, is required to mint.",
-                    );
-                }
-            },
-        };
-        // refuse a taken output before an invoice exists for it
-        if self.store.note_record(&note_id)?.is_some()
-            || self.store.pending_mint_by_note_id(&note_id)?.is_some()
-        {
-            return reject("already in use");
-        }
         if let Err(e) = self.ln.ready() {
             log::warn!("refusing a mint: {e:#}");
             return reject("Minting is temporarily unavailable.");
         }
-        let invoice = self
-            .ln
-            .create_invoice(amount, &metadata, &note_id)
-            .map_err(MintError::Internal)?;
-        self.store
-            .create_mint(&invoice.payment_hash, &invoice.bolt11, net, &note_id)?;
+        let invoice = match &username {
+            Some(name) => {
+                // keys the invoice's preimage; the note is picked at settlement
+                let label = format!("address:{}", hex::encode(rand::random::<[u8; 16]>()));
+                let invoice = self
+                    .ln
+                    .create_invoice(amount, &metadata, &label)
+                    .map_err(MintError::Internal)?;
+                self.store.create_address_mint(
+                    &invoice.payment_hash,
+                    &invoice.bolt11,
+                    net,
+                    name,
+                    &label,
+                )?;
+                invoice
+            }
+            None => {
+                let Some(note_id) = comment.and_then(spend::note_id_of_ref) else {
+                    return reject(
+                        "Missing or malformed comment: a cp1<Q>, or a bearer note's \
+                         hex-encoded 32-byte hash, is required to mint.",
+                    );
+                };
+                // refuse a taken output before an invoice exists for it
+                if self.store.note_record(&note_id)?.is_some()
+                    || self.store.pending_mint_by_note_id(&note_id)?.is_some()
+                {
+                    return reject("already in use");
+                }
+                let invoice = self
+                    .ln
+                    .create_invoice(amount, &metadata, &note_id)
+                    .map_err(MintError::Internal)?;
+                self.store
+                    .create_mint(&invoice.payment_hash, &invoice.bolt11, net, &note_id)?;
+                invoice
+            }
+        };
         Ok(compact(json!({
             "pr": invoice.bolt11,
             "routes": [],
             "disposable": false,
             "verify": s.verify_enabled.then(|| format!("{base}/verify/{}", invoice.payment_hash)),
         })))
+    }
+
+    /// `GET /p/<username>?amount=..&k1=..`: LUD-26's internal transfer. The
+    /// note is burned and its full value credited, free of fees, to the next
+    /// unused note of the username's share, which the payer never learns.
+    pub fn internal_transfer(
+        &self,
+        username: &str,
+        amount: u64,
+        k1: &str,
+        request_host: Option<&str>,
+    ) -> MintResult<Value> {
+        let username = address_name(username);
+        if self.is_own_username(&username) || self.registered_branch(&username)?.is_none() {
+            return reject("unknown user");
+        }
+        let s = &self.settings;
+        if amount < s.min_sendable() || amount > s.max_sendable_msat {
+            return reject("Amount outside what this address accepts.");
+        }
+        let (note_id, record) = self.verified_note(k1)?;
+        let note_ids = [note_id];
+        // a retry gets its original answer, as a rotate's does
+        if let Some(burn) = self.store.find_burn(&note_ids)? {
+            if burn.to_username.as_deref() == Some(username.as_str()) && burn.amount1_msat == amount
+            {
+                return Ok(json!({"status": "OK"}));
+            }
+        }
+        if record.spent {
+            return reject("already in use");
+        }
+        if record.pending {
+            return reject("pending");
+        }
+        if amount != record.amount_msat {
+            return reject(format!(
+                "amount must be the note's full value, {} msat - split it first.",
+                record.amount_msat
+            ));
+        }
+        let credited =
+            self.store
+                .transfer_to_username(&note_ids, &username, amount, &share_note_id)?;
+        log::info!(
+            "TRANSFER {} -> {username}: {credited} {amount} msat ({})",
+            note_ids[0],
+            self.domain(request_host)
+        );
+        Ok(json!({"status": "OK"}))
     }
 
     /// `GET /verify/<payment_hash>`: LUD-21, for a mint invoice or a melt.
@@ -326,8 +454,8 @@ impl AppState {
             return Ok(compact(json!({
                 "status": "OK",
                 "settled": settled,
-                "preimage": match self.store.mint_note_id(payment_hash)? {
-                    Some(note_id) if settled => Some(hex::encode(self.ln.mint_preimage(&note_id))),
+                "preimage": match self.store.mint_preimage_label(payment_hash)? {
+                    Some(label) if settled => Some(hex::encode(self.ln.mint_preimage(&label))),
                     _ => None,
                 },
                 "pr": pr,
@@ -392,8 +520,9 @@ impl AppState {
             }
             _ => return reject("Specify exactly one of k1 or p."),
         };
+        // what a recovery scan counts as a used index (LUD-26)
         if record.spent {
-            return reject("Note already spent.");
+            return reject("already in use");
         }
         // a note mid-melt must not be advertised as withdrawable
         if record.pending {
@@ -408,7 +537,7 @@ impl AppState {
             "maxWithdrawable": record.amount_msat,
             "defaultDescription": format!("lnurlcash bearer note on {host}"),
             "mintPubkey": self.mint_pubkey(),
-            "c": self.certificate(&note_id, record.amount_msat),
+            "c": self.certificate(&self.domain(request_host), &note_id, record.amount_msat),
         })))
     }
 
@@ -449,6 +578,10 @@ impl AppState {
                     Some(id) => Some(id),
                     None => return reject("missing p2"),
                 };
+                // compared as Q: a cp1 and its hex h are one note
+                if p1_id == p2_id {
+                    return reject("p1 and p2 are the same note");
+                }
             }
         }
 
@@ -458,7 +591,14 @@ impl AppState {
             notes.push(self.verified_note(k1)?);
         }
         let note_ids: Vec<String> = notes.iter().map(|(id, _)| id.clone()).collect();
+        // compared as Q, never as raw k1s: a hex preimage and its cw1, or a
+        // ck1 and a cw1 of a key with a script tree, are one note
+        let mut seen = HashSet::new();
+        if !note_ids.iter().all(|id| seen.insert(id)) {
+            return reject("the same note is spent twice");
+        }
 
+        let domain = self.domain(request_host);
         if pr.is_none() {
             // a retried rotate/split/merge gets its original answer
             if let Some(burn) = self.store.find_burn(&note_ids)? {
@@ -468,19 +608,20 @@ impl AppState {
                     && recorded_amount == amount
                 {
                     let c2 = match (&burn.id2, burn.amount2_msat) {
-                        (Some(id2), Some(a2)) => self.certificate(id2, a2),
+                        (Some(id2), Some(a2)) => self.certificate(&domain, id2, a2),
                         _ => None,
                     };
                     return Ok(compact(json!({
                         "status": "OK",
-                        "c": self.certificate(&burn.id, burn.amount1_msat),
+                        "c": self.certificate(&domain, &burn.id, burn.amount1_msat),
                         "c2": c2,
                     })));
                 }
             }
         }
+        // a burned note, or a retry naming other outputs (LUD-25)
         if notes.iter().any(|(_, r)| r.spent) {
-            return reject(spend::INVALID_K1);
+            return reject("already in use");
         }
         if notes.iter().any(|(_, r)| r.pending) {
             return reject("pending");
@@ -510,8 +651,8 @@ impl AppState {
             )?;
             return Ok(compact(json!({
                 "status": "OK",
-                "c": self.certificate(&p1_id, amount),
-                "c2": self.certificate(&p2_id, change),
+                "c": self.certificate(&domain, &p1_id, amount),
+                "c2": self.certificate(&domain, &p2_id, change),
             })));
         }
 
@@ -520,7 +661,7 @@ impl AppState {
         self.store.swap(&note_ids, &[(p1_id.clone(), merged)])?;
         Ok(compact(json!({
             "status": "OK",
-            "c": self.certificate(&p1_id, merged),
+            "c": self.certificate(&domain, &p1_id, merged),
         })))
     }
 
@@ -681,8 +822,14 @@ impl AppState {
     }
 
     // ---- Lightning Address registration (LUD-26) ----
+    //
+    // At the address itself: POST registers, PUT moves it to a new share,
+    // DELETE frees it. Every proof is a share's own key over a message that
+    // binds this mint's domain, the username and, for register and update,
+    // the cx1 put on file.
 
-    /// `POST /p/<username>?cx1=..&sig=..[&npub=..]`: claim or overwrite.
+    /// `POST /.well-known/lnurlp/<username>`: `cx1`, `sig`, optional `npub`.
+    /// Never overwrites a registration, and never takes a share twice.
     pub fn register(
         &self,
         username: &str,
@@ -698,10 +845,9 @@ impl AppState {
         if !valid_username(&username) || self.is_own_username(&username) {
             return reject("Invalid or reserved username.");
         }
-        let Some(branch) = decode_cx1(cx1) else {
+        let Some(share) = decode_cx1(cx1) else {
             return reject("Invalid cx1.");
         };
-        let branch_hex = hex::encode([branch.pubkey_x_only, branch.chain_code].concat());
         let nostr_pubkey = match npub {
             None => None,
             Some(_) if !self.settings.nip05_enabled => {
@@ -712,21 +858,71 @@ impl AppState {
                 None => return reject("Invalid npub."),
             },
         };
-        // a fresh claim proves the new branch; an overwrite proves the one on file
-        let proof_branch = self
-            .store
-            .username_branch(&username)?
-            .unwrap_or_else(|| branch_hex.clone());
-        let (_, host) = self.settings.public_base_url_and_host(request_host);
-        if !owns_branch("register", &host, &username, &proof_branch, sig) {
+        let domain = self.domain(request_host);
+        if !proves(
+            "register",
+            &domain,
+            &username,
+            Some(cx1),
+            share.pubkey_x_only(),
+            sig,
+        ) {
             return reject("Invalid ownership signature.");
         }
-        self.store
-            .upsert_username(&username, &branch_hex, nostr_pubkey.as_deref())?;
+        self.store.register_username(
+            &username,
+            &Share::of(&share),
+            &hex::encode(share.pubkey_x_only()),
+            nostr_pubkey.as_deref(),
+        )?;
         Ok(json!({"status": "OK"}))
     }
 
-    /// `DELETE /p/<username>?sig=..`: free a username, proven by the branch on file.
+    /// `PUT /.well-known/lnurlp/<username>`: `cx1` (the new share), `sig` by
+    /// the key on file over the update message, `newsig` by the new share
+    /// over the register message. The username is never free in between.
+    pub fn update(
+        &self,
+        username: &str,
+        cx1: &str,
+        sig: &str,
+        newsig: &str,
+        request_host: Option<&str>,
+    ) -> MintResult<Value> {
+        if !self.settings.username_registration_enabled {
+            return reject("Not found");
+        }
+        let username = username.to_ascii_lowercase();
+        let Some(on_file) = self.registered_branch(&username)? else {
+            return reject("unknown user");
+        };
+        let on_file = Share::on_file(&on_file)
+            .ok_or_else(|| MintError::Internal(anyhow::anyhow!("corrupt cx1 on file")))?;
+        let Some(share) = decode_cx1(cx1) else {
+            return reject("Invalid cx1.");
+        };
+        let domain = self.domain(request_host);
+        if !proves("update", &domain, &username, Some(cx1), on_file.xp(), sig)
+            || !proves(
+                "register",
+                &domain,
+                &username,
+                Some(cx1),
+                share.pubkey_x_only(),
+                newsig,
+            )
+        {
+            return reject("Invalid ownership signature.");
+        }
+        self.store.update_username(
+            &username,
+            &Share::of(&share),
+            &hex::encode(share.pubkey_x_only()),
+        )?;
+        Ok(json!({"status": "OK"}))
+    }
+
+    /// `DELETE /.well-known/lnurlp/<username>`: `sig` by the key on file.
     pub fn unregister(
         &self,
         username: &str,
@@ -737,11 +933,19 @@ impl AppState {
             return reject("Not found");
         }
         let username = username.to_ascii_lowercase();
-        let Some(branch_hex) = self.store.username_branch(&username)? else {
-            return reject("Unknown user.");
+        let Some(on_file) = self.store.username_branch(&username)? else {
+            return reject("unknown user");
         };
-        let (_, host) = self.settings.public_base_url_and_host(request_host);
-        if !owns_branch("unregister", &host, &username, &branch_hex, sig) {
+        let on_file = Share::on_file(&on_file)
+            .ok_or_else(|| MintError::Internal(anyhow::anyhow!("corrupt cx1 on file")))?;
+        if !proves(
+            "unregister",
+            &self.domain(request_host),
+            &username,
+            None,
+            on_file.xp(),
+            sig,
+        ) {
             return reject("Invalid ownership signature.");
         }
         self.store.delete_username(&username)?;
@@ -765,13 +969,13 @@ impl AppState {
     /// `GET /.well-known/lnurlw/<username>`: informational only. Describes
     /// this mint and points back at its payRequest; there is no balance here.
     pub fn mint_address(&self, username: &str, request_host: Option<&str>) -> MintResult<Value> {
-        let username = username.to_ascii_lowercase();
+        let username = address_name(username);
         let name = if self.is_own_username(&username) {
             self.settings.username.to_ascii_lowercase()
         } else if self.registered_branch(&username)?.is_some() {
             username
         } else {
-            return reject("Unknown user.");
+            return reject("unknown user");
         };
         let (base, host) = self.settings.public_base_url_and_host(request_host);
         let info = self.ln.info().ok();
@@ -800,7 +1004,8 @@ impl AppState {
 mod tests {
     use super::*;
     use lnurlcash_core::{
-        recoverable::{derive_note_secret_key, encode_cx1},
+        cash::{derive_cash_root, derive_service_root},
+        recoverable::{cash_node_to_cx1, derive_share_node},
         signature::sign_address_proof,
     };
 
@@ -813,44 +1018,86 @@ mod tests {
     }
 
     #[test]
-    fn registration_proofs_bind_action_domain_and_username() {
-        let branch_sk = [11u8; 32];
-        let chain_code = [2u8; 32];
-        let kp = secp256k1::Keypair::from_secret_bytes(branch_sk).unwrap();
-        let point = kp.x_only_public_key().0.to_byte_array();
-        let branch_hex = hex::encode([point, chain_code].concat());
-        let sk0 = derive_note_secret_key(&branch_sk, &chain_code, PURPOSE_WALLET, 0).unwrap();
-        let sig =
-            hex::encode(sign_address_proof(&sk0, "register", "mint.example", "alice").unwrap());
-        assert!(owns_branch(
+    fn usernames_drop_their_tag() {
+        assert_eq!(address_name("Alice+Coffee"), "alice");
+        assert_eq!(address_name("bob"), "bob");
+    }
+
+    #[test]
+    fn registration_proofs_bind_action_domain_username_and_cx1() {
+        let root =
+            derive_service_root(&derive_cash_root(&[3; 32]).unwrap(), "mint.example").unwrap();
+        let node = derive_share_node(&root, 0, 0).unwrap();
+        let share = cash_node_to_cx1(&node).unwrap();
+        let cx1 = encode_cx1(&share);
+        let other =
+            encode_cx1(&cash_node_to_cx1(&derive_share_node(&root, 0, 1).unwrap()).unwrap());
+        let sig = hex::encode(
+            sign_address_proof(
+                &node.private_key,
+                "register",
+                "mint.example",
+                "alice",
+                Some(&cx1),
+            )
+            .unwrap(),
+        );
+        let xp = share.pubkey_x_only();
+        assert!(proves(
             "register",
             "mint.example",
             "alice",
-            &branch_hex,
+            Some(&cx1),
+            xp,
             &sig
         ));
-        assert!(!owns_branch(
-            "unregister",
+        assert!(!proves(
+            "update",
             "mint.example",
             "alice",
-            &branch_hex,
+            Some(&cx1),
+            xp,
             &sig
         ));
-        assert!(!owns_branch(
+        assert!(!proves(
             "register",
             "other.example",
             "alice",
-            &branch_hex,
+            Some(&cx1),
+            xp,
             &sig
         ));
-        assert!(!owns_branch(
+        assert!(!proves(
             "register",
             "mint.example",
             "bob",
-            &branch_hex,
+            Some(&cx1),
+            xp,
             &sig
         ));
-        assert!(decode_cx1(&encode_cx1(&point, &chain_code)).is_some());
+        assert!(!proves(
+            "register",
+            "mint.example",
+            "alice",
+            Some(&other),
+            xp,
+            &sig
+        ));
+        assert!(!proves(
+            "register",
+            "mint.example",
+            "alice",
+            Some(&cx1),
+            xp,
+            "00"
+        ));
+        // a share on file reads back as itself
+        let on_file = Share::on_file(&Share::of(&share)).unwrap();
+        assert!(!on_file.is_legacy() && on_file.cx1() == cx1 && on_file.xp() == xp);
+        assert_eq!(
+            share_note_id(&Share::of(&share), 4),
+            derive_note_pubkey(&share, 4).ok().map(hex::encode)
+        );
     }
 
     #[test]

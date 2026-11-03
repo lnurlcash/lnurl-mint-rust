@@ -70,7 +70,7 @@ fn handle(node: &Node, store: &NoteStore, preimage_key: &[u8; 32], event: &Event
             ..
         } => {
             let hash = hex::encode(payment_hash.0);
-            match store.settle_mint(&hash)? {
+            match store.settle_mint(&hash, &crate::mint::share_note_id)? {
                 Some((note_id, value)) => {
                     log::info!("MINT {note_id} {value} msat (paid {amount_msat} msat, {hash})")
                 }

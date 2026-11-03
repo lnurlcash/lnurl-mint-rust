@@ -93,9 +93,10 @@ pub fn verify(parsed: &ParsedK1, locked_at: u64, domains: &[String], now: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lnurlcash_core::cash::{derive_cash_root, derive_service_root};
     use lnurlcash_core::recoverable::{
-        derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1, encode_cw1,
-        sign_note_ownership,
+        NotePath, cash_node_to_cx1, derive_note_key, derive_note_pubkey, derive_share_node,
+        encode_ck1, encode_cp1, encode_cw1, sign_note_ownership,
     };
     use lnurlcash_core::spend::bearer_cw1;
     use sha2::{Digest, Sha256};
@@ -138,15 +139,21 @@ mod tests {
         );
     }
 
+    /// What this mint credits a share with, from its cx1 alone, is the key
+    /// its holder spends.
     #[test]
     fn derived_keys_match_cx1_derivation() {
-        let branch_sk = [9u8; 32];
-        let chain = [1u8; 32];
-        let kp = secp256k1::Keypair::from_secret_bytes(branch_sk).unwrap();
-        let p = kp.x_only_public_key().0.to_byte_array();
-        let sk = derive_note_secret_key(&branch_sk, &chain, 2, 5).unwrap();
-        let q = derive_note_pubkey(&p, &chain, 2, 5).unwrap();
-        let ck1 = encode_ck1(&sign_note_ownership(&sk, "mint.example").unwrap());
+        let root =
+            derive_service_root(&derive_cash_root(&[9; 32]).unwrap(), "mint.example").unwrap();
+        let cx1 = cash_node_to_cx1(&derive_share_node(&root, 0, 0).unwrap()).unwrap();
+        let path = NotePath::Share {
+            account: 0,
+            share: 0,
+            index: 5,
+        };
+        let key = derive_note_key(&root, path).unwrap();
+        let q = derive_note_pubkey(&cx1, 5).unwrap();
+        let ck1 = encode_ck1(&sign_note_ownership(&key.secret_key, "mint.example").unwrap());
         assert_eq!(parse(&ck1).unwrap().note_id, hex::encode(q));
     }
 
