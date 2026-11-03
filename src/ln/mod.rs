@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use crate::db::NoteStore;
 
 /// How long a mint (or operator) invoice can be paid.
-const INVOICE_EXPIRY_SECS: u32 = 3600;
+pub const INVOICE_EXPIRY_SECS: u32 = 3600;
 
 /// The chain this node runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,9 +447,11 @@ impl Ln {
         self.node.as_ref().map(|n| n.node_id().to_string())
     }
 
-    /// The preimage of the mint invoice crediting `note_id`. A note id names
-    /// one mint invoice ever (the store refuses a second), so the preimage is
-    /// unique to it, and the mint can claim the payment without storing it.
+    /// The preimage of the mint invoice crediting `note_id`, or of the
+    /// invoice keyed by a random label (an address mint, an address fee). A
+    /// note id names one mint invoice ever (the store refuses a second), so
+    /// the preimage is unique to it, and the mint can claim the payment
+    /// without storing it.
     pub fn mint_preimage(&self, note_id: &str) -> [u8; 32] {
         mint_preimage(&self.preimage_key, note_id)
     }
@@ -463,15 +465,35 @@ impl Ln {
         description: &str,
         note_id: &str,
     ) -> Result<Invoice> {
-        let node = self.node()?;
-        let hash = sha256::Hash::hash(&self.mint_preimage(note_id));
         let description =
             Bolt11InvoiceDescription::Hash(Sha256(sha256::Hash::hash(description.as_bytes())));
+        self.invoice_for_label(amount_msat, &description, note_id)
+    }
+
+    /// The invoice for LUD-26's address fee: `description` in the clear,
+    /// its preimage keyed by `label`. Claimed by hand like a mint's.
+    pub fn create_address_fee_invoice(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        label: &str,
+    ) -> Result<Invoice> {
+        self.invoice_for_label(amount_msat, &direct(description)?, label)
+    }
+
+    fn invoice_for_label(
+        &self,
+        amount_msat: u64,
+        description: &Bolt11InvoiceDescription,
+        label: &str,
+    ) -> Result<Invoice> {
+        let node = self.node()?;
+        let hash = sha256::Hash::hash(&self.mint_preimage(label));
         let invoice = node
             .bolt11_payment()
             .receive_for_hash(
                 amount_msat,
-                &description,
+                description,
                 INVOICE_EXPIRY_SECS,
                 PaymentHash(hash.to_byte_array()),
             )

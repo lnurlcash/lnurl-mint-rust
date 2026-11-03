@@ -347,14 +347,17 @@ async fn frontend(State(state): State<AppState>, headers: HeaderMap) -> Response
             .collect();
         format!("<h2>Connect to the node</h2>{rows}")
     };
-    let fees = if s.has_fee() {
-        format!(
-            "{} msat + {} ppm per mint",
-            s.base_fee_msat, s.fee_percent_ppm
-        )
+    let mut fees = if s.has_fee() {
+        format!("{} msat + {} ppm per mint", s.base_fee_msat, s.fee_ppm)
     } else {
         "none".into()
     };
+    if s.address_fee() != 0 {
+        fees = format!(
+            "{fees} &middot; Address fee: {} msat per registration",
+            s.address_fee()
+        );
+    }
     let sunset = if s.sunset_mint {
         "<p class=warn>This mint is winding down: minting and splitting are disabled.</p>"
     } else {
@@ -917,6 +920,117 @@ mod tests {
             "cx1 already used"
         );
         ok(&register(&state, "alice", 2).await);
+    }
+
+    /// A regtest invoice for `amount_msat` to payment hash `[seed; 32]`, as
+    /// the node would issue for an address fee.
+    fn regtest_invoice(seed: u8, amount_msat: u64) -> (String, String) {
+        use ldk_node::{
+            bitcoin::{
+                hashes::{Hash, sha256},
+                secp256k1::{Secp256k1, SecretKey},
+            },
+            lightning_invoice::{Currency, InvoiceBuilder},
+            lightning_types::payment::PaymentSecret,
+        };
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let hash = sha256::Hash::from_byte_array([seed; 32]);
+        let invoice = InvoiceBuilder::new(Currency::Regtest)
+            .description("Register".into())
+            .payment_hash(hash)
+            .payment_secret(PaymentSecret([1; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .amount_milli_satoshis(amount_msat)
+            .build_signed(|m| Secp256k1::new().sign_ecdsa_recoverable(m, &key))
+            .unwrap();
+        (invoice.to_string(), hex::encode([seed; 32]))
+    }
+
+    #[tokio::test]
+    async fn an_address_fee_holds_the_username_until_it_is_paid() {
+        let mut settings = test_settings();
+        settings.address_fee_msat = 21_000;
+        let state = AppState::new(
+            settings,
+            std::sync::Arc::new(NoteStore::in_memory().unwrap()),
+            Ln::new(Network::Regtest),
+        );
+        // announced at mint@, the third Mint fees value
+        let v = get(&state, "/.well-known/lnurlp/mint").await;
+        assert!(
+            v["metadata"]
+                .as_str()
+                .unwrap()
+                .contains("Mint fees: 1000,2000,21000")
+        );
+        // no node, no invoice: nothing is held
+        assert_eq!(
+            reason(&register(&state, "alice", 0).await),
+            "Registration is temporarily unavailable."
+        );
+        assert!(!state.store.username_taken("alice").unwrap());
+
+        // held, as a registration the node issued an invoice for would be
+        let (pr, hash) = regtest_invoice(9, 21_000);
+        let (_, cx1) = share(1);
+        let share1 = lnurlcash_core::recoverable::decode_cx1(&cx1).unwrap();
+        state
+            .store
+            .hold_username(
+                &hash,
+                &pr,
+                "alice",
+                &crate::mint::Share::of(&share1),
+                &hex::encode(share1.pubkey_x_only()),
+                None,
+                21_000,
+                "address-fee:test",
+                crate::db::now() + 3600,
+            )
+            .unwrap();
+        // not published, and nobody else gets it meanwhile
+        assert_eq!(
+            reason(&register(&state, "alice", 2).await),
+            "already registered"
+        );
+        let uri = "/.well-known/lnurlp/alice";
+        assert_eq!(reason(&get(&state, uri).await), "unknown user");
+        let (k1, h) = bearer(1);
+        credit(&state, &h, 21_000);
+        let transfer = format!("/p/alice?amount=21000&k1={k1}");
+        assert_eq!(reason(&get(&state, &transfer).await), "unknown user");
+
+        // a note of another value does not pay it
+        let (k1b, hb) = bearer(2);
+        credit(&state, &hb, 20_000);
+        let v = get(&state, &format!("/w/cb?k1={k1b}&pr={pr}")).await;
+        assert_eq!(reason(&v), "Invoice must be for exactly 20000 msat.");
+        assert_eq!(value_of(&state, &k1b).await, 20_000);
+
+        // melting a note into it pays it here, with no node at all
+        let v = get(&state, &format!("/w/cb?k1={k1}&pr={pr}")).await;
+        ok(&v);
+        assert_eq!(v["verify"], format!("https://mint.example/verify/{hash}"));
+        assert_eq!(
+            reason(&get(&state, &format!("/w?k1={k1}")).await),
+            "already in use"
+        );
+        assert_eq!(
+            get(&state, uri).await["callback"],
+            "https://mint.example/p/alice"
+        );
+        let v = get(&state, &format!("/verify/{hash}")).await;
+        assert_eq!(
+            (v["settled"].as_bool(), v["pr"].as_str()),
+            (Some(true), Some(pr.as_str()))
+        );
+        // paid once
+        let (k1c, hc) = bearer(3);
+        credit(&state, &hc, 21_000);
+        let v = get(&state, &format!("/w/cb?k1={k1c}&pr={pr}")).await;
+        assert_eq!(reason(&v), "address fee invoice already paid or expired");
+        assert_eq!(value_of(&state, &k1c).await, 21_000);
     }
 
     #[tokio::test]

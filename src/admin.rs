@@ -156,7 +156,8 @@ fn info_now(state: &AppState) -> AdminResult {
         "min_sendable_msat": s.min_sendable(),
         "max_sendable_msat": s.max_sendable_msat,
         "base_fee_msat": s.base_fee_msat,
-        "fee_percent_ppm": s.fee_percent_ppm,
+        "fee_ppm": s.fee_ppm,
+        "address_fee_msat": s.address_fee(),
         "sunset_mint": s.sunset_mint,
         "stats": state.store.stats().map_err(internal)?,
     })))
@@ -233,7 +234,22 @@ fn users_now(state: &AppState) -> AdminResult {
             })
         })
         .collect();
-    Ok(Json(json!({"users": users})))
+    // held for an unpaid address fee (LUD-26): registered once it is paid
+    let held: Vec<Value> = state
+        .store
+        .held_usernames()
+        .map_err(internal)?
+        .into_iter()
+        .map(|fee| {
+            json!({
+                "username": fee.username,
+                "amount_msat": fee.amount_msat,
+                "payment_hash": fee.payment_hash,
+                "expires_at": fee.expires_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"users": users, "held": held})))
 }
 
 // ---- the node ----

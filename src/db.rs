@@ -33,6 +33,9 @@ pub enum StoreError {
     KeyUsed,
     /// A username nobody has registered.
     UnknownUser,
+    /// An address fee invoice that is paid already, expired, or not for the
+    /// amount offered (LUD-26).
+    FeeNotPayable,
     Sql(rusqlite::Error),
 }
 
@@ -51,6 +54,7 @@ impl std::fmt::Display for StoreError {
             StoreError::AlreadyRegistered => f.write_str("already registered"),
             StoreError::KeyUsed => f.write_str("cx1 already used"),
             StoreError::UnknownUser => f.write_str("unknown user"),
+            StoreError::FeeNotPayable => f.write_str("address fee invoice already paid or expired"),
             StoreError::Sql(err) => write!(f, "database error: {err}"),
         }
     }
@@ -94,6 +98,32 @@ pub struct Stats {
     pub pending_notes: u64,
     pub unpaid_mints: u64,
     pub usernames: u64,
+    /// Usernames held for a registration whose address fee is unpaid.
+    pub held_usernames: u64,
+}
+
+/// A registration held for its address fee (LUD-26).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressFee {
+    pub payment_hash: String,
+    pub pr: String,
+    pub username: String,
+    pub amount_msat: u64,
+    /// What the fee invoice's preimage is keyed by.
+    pub label: String,
+    pub expires_at: u64,
+    pub paid: bool,
+}
+
+/// A held registration whose fee was just paid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaidAddressFee {
+    pub username: String,
+    pub amount_msat: u64,
+    /// False only if the hold lapsed and somebody else registered the
+    /// username before the payment settled: the fee is kept, nothing is
+    /// registered.
+    pub registered: bool,
 }
 
 pub fn now() -> u64 {
@@ -165,7 +195,19 @@ impl NoteStore {
                 payment_hash TEXT PRIMARY KEY,
                 amount_msat INTEGER NOT NULL,
                 paid INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL DEFAULT 0);",
+                created_at INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS address_fees (
+                payment_hash TEXT PRIMARY KEY,
+                pr TEXT NOT NULL,
+                username TEXT NOT NULL,
+                cx1 TEXT NOT NULL,
+                nostr_pubkey TEXT,
+                amount_msat INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                paid INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX IF NOT EXISTS address_fees_username ON address_fees (username);",
         )?;
         // columns lnurl-mint renamed and added over time, for a database
         // carried over from it, in lnurl-mint's own order: renames first, so
@@ -386,6 +428,11 @@ impl NoteStore {
                 as u64,
             unpaid_mints: count("SELECT COUNT(*) FROM mints WHERE minted = 0")? as u64,
             usernames: count("SELECT COUNT(*) FROM usernames")? as u64,
+            held_usernames: conn.query_row(
+                "SELECT COUNT(*) FROM address_fees WHERE paid = 0 AND expires_at > ?1",
+                [now() as i64],
+                |row| row.get::<_, i64>(0),
+            )? as u64,
         })
     }
 
@@ -559,13 +606,26 @@ impl NoteStore {
     /// pays an unsettled mint invoice. Anything else is failed back, a second
     /// payment of a settled invoice included.
     pub fn claimable(&self, payment_hash: &str) -> StoreResult<Option<String>> {
-        Ok(self
-            .conn()
+        let conn = self.conn();
+        let mint = conn
             .query_row(
                 "SELECT COALESCE(label, note_id) FROM mints
                  WHERE payment_hash = ?1 AND minted = 0
                    AND (note_id IS NOT NULL OR username IS NOT NULL)",
                 [payment_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if mint.is_some() {
+            return Ok(mint);
+        }
+        // an address fee, while its hold stands: once it lapsed the username
+        // may be somebody else's, so a late payment is failed back
+        Ok(conn
+            .query_row(
+                "SELECT label FROM address_fees
+                 WHERE payment_hash = ?1 AND paid = 0 AND expires_at > ?2",
+                params![payment_hash, now() as i64],
                 |row| row.get(0),
             )
             .optional()?)
@@ -645,12 +705,7 @@ impl NoteStore {
     ) -> StoreResult<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM usernames WHERE username = ?1)",
-            [username],
-            |row| row.get(0),
-        )?;
-        if exists {
+        if username_taken(&tx, username)? {
             return Err(StoreError::AlreadyRegistered);
         }
         accept_key(&tx, xp_hex)?;
@@ -660,6 +715,121 @@ impl NoteStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Whether `username` is registered, or held for an unpaid address fee.
+    pub fn username_taken(&self, username: &str) -> StoreResult<bool> {
+        Ok(username_taken(&self.conn(), username)?)
+    }
+
+    /// Hold `username` for a registration until its address fee invoice
+    /// `payment_hash` is paid, or released once it expires at `expires_at`
+    /// (LUD-26). Refuses what `register_username` refuses, and takes the
+    /// share key now, so a captured proof never applies again even if the
+    /// invoice lapses. The caller has already checked the proof.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_username(
+        &self,
+        payment_hash: &str,
+        pr: &str,
+        username: &str,
+        cx1_hex: &str,
+        xp_hex: &str,
+        nostr_pubkey_hex: Option<&str>,
+        amount_msat: u64,
+        label: &str,
+        expires_at: u64,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if username_taken(&tx, username)? {
+            return Err(StoreError::AlreadyRegistered);
+        }
+        accept_key(&tx, xp_hex)?;
+        tx.execute(
+            "INSERT INTO address_fees (payment_hash, pr, username, cx1, nostr_pubkey,
+                amount_msat, label, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                payment_hash,
+                pr,
+                username,
+                cx1_hex,
+                nostr_pubkey_hex,
+                amount_msat as i64,
+                label,
+                now() as i64,
+                expires_at as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The address fee invoice `payment_hash`, paid or not.
+    pub fn address_fee(&self, payment_hash: &str) -> StoreResult<Option<AddressFee>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT payment_hash, pr, username, amount_msat, label, expires_at, paid
+                 FROM address_fees WHERE payment_hash = ?1",
+                [payment_hash],
+                address_fee_row,
+            )
+            .optional()?)
+    }
+
+    /// Every username held for an unpaid, unexpired address fee.
+    pub fn held_usernames(&self) -> StoreResult<Vec<AddressFee>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payment_hash, pr, username, amount_msat, label, expires_at, paid
+             FROM address_fees WHERE paid = 0 AND expires_at > ?1 ORDER BY username",
+        )?;
+        let rows = stmt.query_map([now() as i64], address_fee_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Register the username a paid address fee held. `None` if the invoice
+    /// was settled before (or is unknown). Never checks the expiry: the
+    /// payment was claimed while the hold stood.
+    pub fn settle_address_fee(&self, payment_hash: &str) -> StoreResult<Option<PaidAddressFee>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let paid = settle_address_fee_in(&tx, payment_hash)?;
+        tx.commit()?;
+        Ok(paid)
+    }
+
+    /// Pay the address fee invoice `payment_hash` with notes this mint
+    /// issued: burn `note_ids`, worth `total_msat`, and register the held
+    /// username, all at once. The invoice must be unpaid, unexpired and for
+    /// exactly `total_msat`. Returns the username registered.
+    pub fn pay_address_fee_with_notes(
+        &self,
+        note_ids: &[String],
+        payment_hash: &str,
+        total_msat: u64,
+    ) -> StoreResult<String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let payable: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM address_fees WHERE payment_hash = ?1
+                AND paid = 0 AND expires_at > ?2 AND amount_msat = ?3)",
+            params![payment_hash, now() as i64, total_msat as i64],
+            |row| row.get(0),
+        )?;
+        if !payable {
+            return Err(StoreError::FeeNotPayable);
+        }
+        burn_in(&tx, note_ids)?;
+        let paid = settle_address_fee_in(&tx, payment_hash)?.ok_or(StoreError::FeeNotPayable)?;
+        if !paid.registered {
+            // the hold stood a moment ago: never burn for nothing
+            return Err(StoreError::AlreadyRegistered);
+        }
+        tx.commit()?;
+        Ok(paid.username)
     }
 
     /// Move a registered `username` to a new share without ever freeing it
@@ -730,32 +900,12 @@ fn swap_in(
     outputs: &[(String, u64)],
     to_username: Option<&str>,
 ) -> StoreResult<()> {
-    let mut seen = HashSet::new();
-    for id in burn_ids {
-        if !seen.insert(id) {
-            return Err(StoreError::Invalid);
-        }
-        let pending: Option<i64> = tx
-            .query_row(
-                "SELECT pending FROM notes WHERE id = ?1 AND spent = 0",
-                [id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match pending {
-            None => return Err(StoreError::Invalid),
-            Some(p) if p != 0 => return Err(StoreError::Pending),
-            _ => {}
-        }
-    }
+    burn_in(tx, burn_ids)?;
     let mut seen = HashSet::new();
     for (id, _) in outputs {
         if !seen.insert(id) || id_in_use(tx, id)? {
             return Err(StoreError::InUse);
         }
-    }
-    for id in burn_ids {
-        tx.execute("UPDATE notes SET spent = 1 WHERE id = ?1", [id])?;
     }
     let locked_at = now() as i64;
     for (id, amount) in outputs {
@@ -777,6 +927,92 @@ fn swap_in(
         ],
     )?;
     Ok(())
+}
+
+/// Burn `note_ids` inside `tx`: every one unspent and not reserved by a melt.
+fn burn_in(tx: &rusqlite::Transaction<'_>, note_ids: &[String]) -> StoreResult<()> {
+    let mut seen = HashSet::new();
+    for id in note_ids {
+        if !seen.insert(id) {
+            return Err(StoreError::Invalid);
+        }
+        let pending: Option<i64> = tx
+            .query_row(
+                "SELECT pending FROM notes WHERE id = ?1 AND spent = 0",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match pending {
+            None => return Err(StoreError::Invalid),
+            Some(p) if p != 0 => return Err(StoreError::Pending),
+            _ => {}
+        }
+    }
+    for id in note_ids {
+        tx.execute("UPDATE notes SET spent = 1 WHERE id = ?1", [id])?;
+    }
+    Ok(())
+}
+
+/// Whether `username` is registered, or held for an address fee whose
+/// invoice is unpaid and unexpired.
+fn username_taken(conn: &Connection, username: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usernames WHERE username = ?1)
+             OR EXISTS(SELECT 1 FROM address_fees
+                       WHERE username = ?1 AND paid = 0 AND expires_at > ?2)",
+        params![username, now() as i64],
+        |row| row.get(0),
+    )
+}
+
+/// Mark the address fee `payment_hash` paid and register its username,
+/// unless somebody else holds it by now.
+fn settle_address_fee_in(
+    tx: &rusqlite::Transaction<'_>,
+    payment_hash: &str,
+) -> StoreResult<Option<PaidAddressFee>> {
+    let changed = tx.execute(
+        "UPDATE address_fees SET paid = 1 WHERE payment_hash = ?1 AND paid = 0",
+        [payment_hash],
+    )?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    let (username, cx1_hex, nostr_pubkey, amount_msat): (String, String, Option<String>, i64) = tx
+        .query_row(
+            "SELECT username, cx1, nostr_pubkey, amount_msat FROM address_fees
+             WHERE payment_hash = ?1",
+            [payment_hash],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    // its own hold is paid now, so only a registration (or another hold,
+    // once this one lapsed) can stand in the way
+    let registered = !username_taken(tx, &username)?;
+    if registered {
+        tx.execute(
+            "INSERT INTO usernames (username, cx1, nostr_pubkey, next_index) VALUES (?1, ?2, ?3, 0)",
+            params![username, cx1_hex, nostr_pubkey],
+        )?;
+    }
+    Ok(Some(PaidAddressFee {
+        username,
+        amount_msat: amount_msat as u64,
+        registered,
+    }))
+}
+
+fn address_fee_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AddressFee> {
+    Ok(AddressFee {
+        payment_hash: row.get(0)?,
+        pr: row.get(1)?,
+        username: row.get(2)?,
+        amount_msat: row.get::<_, i64>(3)? as u64,
+        label: row.get(4)?,
+        expires_at: row.get::<_, i64>(5)? as u64,
+        paid: row.get::<_, i64>(6)? != 0,
+    })
 }
 
 /// Record a share key as accepted, refusing one accepted before.
@@ -1176,6 +1412,138 @@ mod tests {
         assert!(matches!(
             store.register_username("alice", "01", "x1", None),
             Err(StoreError::KeyUsed)
+        ));
+    }
+
+    /// Hold `username` for share `xp` behind fee invoice `hash`, expiring
+    /// `ttl` seconds from now (negative: lapsed already).
+    fn hold(store: &NoteStore, hash: &str, username: &str, xp: &str, ttl: i64) {
+        store
+            .hold_username(
+                hash,
+                "lnbc",
+                username,
+                &format!("cx1-{xp}"),
+                xp,
+                None,
+                21_000,
+                &format!("label-{hash}"),
+                (now() as i64 + ttl) as u64,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_held_username_registers_once_its_fee_is_paid() {
+        let store = NoteStore::in_memory().unwrap();
+        hold(&store, "f1", "alice", "x0", 3600);
+        assert!(store.username_taken("alice").unwrap());
+        assert_eq!(store.username_branch("alice").unwrap(), None);
+        assert_eq!(store.stats().unwrap().held_usernames, 1);
+        assert_eq!(store.held_usernames().unwrap()[0].username, "alice");
+        // held for this registration only: nobody else gets it meanwhile
+        assert!(matches!(
+            store.register_username("alice", "01", "x1", None),
+            Err(StoreError::AlreadyRegistered)
+        ));
+        assert!(matches!(
+            store.hold_username("f2", "lnbc", "alice", "01", "x1", None, 1, "l", now() + 60),
+            Err(StoreError::AlreadyRegistered)
+        ));
+        // and its share is taken at once
+        assert!(matches!(
+            store.register_username("bob", "00", "x0", None),
+            Err(StoreError::KeyUsed)
+        ));
+        assert_eq!(store.claimable("f1").unwrap().as_deref(), Some("label-f1"));
+
+        let paid = store.settle_address_fee("f1").unwrap().unwrap();
+        assert_eq!(
+            paid,
+            PaidAddressFee {
+                username: "alice".into(),
+                amount_msat: 21_000,
+                registered: true
+            }
+        );
+        assert_eq!(
+            store.username_branch("alice").unwrap().as_deref(),
+            Some("cx1-x0")
+        );
+        assert_eq!(store.settle_address_fee("f1").unwrap(), None);
+        assert_eq!(store.claimable("f1").unwrap(), None);
+        assert!(store.address_fee("f1").unwrap().unwrap().paid);
+        let stats = store.stats().unwrap();
+        assert_eq!((stats.usernames, stats.held_usernames), (1, 0));
+    }
+
+    #[test]
+    fn a_lapsed_hold_frees_the_username_but_never_its_share() {
+        let store = NoteStore::in_memory().unwrap();
+        hold(&store, "f1", "alice", "x0", -1);
+        assert!(!store.username_taken("alice").unwrap());
+        // a late payment is failed back
+        assert_eq!(store.claimable("f1").unwrap(), None);
+        assert!(matches!(
+            store.register_username("alice", "00", "x0", None),
+            Err(StoreError::KeyUsed)
+        ));
+        store.register_username("alice", "01", "x1", None).unwrap();
+        // one claimed just before it lapsed still settles, and registers
+        // nothing over the new owner
+        assert_eq!(
+            store
+                .settle_address_fee("f1")
+                .unwrap()
+                .map(|p| p.registered),
+            Some(false)
+        );
+        assert_eq!(
+            store.username_branch("alice").unwrap().as_deref(),
+            Some("01")
+        );
+    }
+
+    #[test]
+    fn notes_pay_an_address_fee_exactly_and_atomically() {
+        let store = NoteStore::in_memory().unwrap();
+        hold(&store, "f1", "alice", "x0", 3600);
+        minted(&store, "h1", "q1", 20_000);
+        minted(&store, "h2", "q2", 21_000);
+        // not the fee: nothing burned, nothing registered
+        assert!(matches!(
+            store.pay_address_fee_with_notes(&ids(&["q1"]), "f1", 20_000),
+            Err(StoreError::FeeNotPayable)
+        ));
+        // a note mid-melt pays nothing
+        store.record_melt("m1", "lnbc").unwrap();
+        store.mark_pending(&ids(&["q2"]), "m1").unwrap();
+        assert!(matches!(
+            store.pay_address_fee_with_notes(&ids(&["q2"]), "f1", 21_000),
+            Err(StoreError::Pending)
+        ));
+        store.restore_melt("m1").unwrap();
+        assert_eq!(
+            store
+                .pay_address_fee_with_notes(&ids(&["q2"]), "f1", 21_000)
+                .unwrap(),
+            "alice"
+        );
+        assert!(store.note_record("q2").unwrap().unwrap().spent);
+        assert!(!store.note_record("q1").unwrap().unwrap().spent);
+        assert!(store.username_branch("alice").unwrap().is_some());
+        // paid once
+        minted(&store, "h3", "q3", 21_000);
+        assert!(matches!(
+            store.pay_address_fee_with_notes(&ids(&["q3"]), "f1", 21_000),
+            Err(StoreError::FeeNotPayable)
+        ));
+        assert!(!store.note_record("q3").unwrap().unwrap().spent);
+        // and never into a lapsed hold
+        hold(&store, "f2", "bob", "x5", -1);
+        assert!(matches!(
+            store.pay_address_fee_with_notes(&ids(&["q3"]), "f2", 21_000),
+            Err(StoreError::FeeNotPayable)
         ));
     }
 
