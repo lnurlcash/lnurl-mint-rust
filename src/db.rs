@@ -27,6 +27,12 @@ pub enum StoreError {
     InUse,
     /// A note is unknown, already spent, or named twice.
     Invalid,
+    /// A POST for a username that is already registered (LUD-26).
+    AlreadyRegistered,
+    /// A share whose `x(P)` this mint has accepted before (LUD-26).
+    KeyUsed,
+    /// A username nobody has registered.
+    UnknownUser,
     Sql(rusqlite::Error),
 }
 
@@ -42,6 +48,9 @@ impl std::fmt::Display for StoreError {
             StoreError::Pending => f.write_str("pending"),
             StoreError::InUse => f.write_str("already in use"),
             StoreError::Invalid => f.write_str(INVALID_K1),
+            StoreError::AlreadyRegistered => f.write_str("already registered"),
+            StoreError::KeyUsed => f.write_str("cx1 already used"),
+            StoreError::UnknownUser => f.write_str("unknown user"),
             StoreError::Sql(err) => write!(f, "database error: {err}"),
         }
     }
@@ -61,14 +70,21 @@ pub struct NoteRecord {
     pub pending: bool,
 }
 
-/// What an earlier rotate, split or merge of the same set of notes minted.
+/// What an earlier rotate, split, merge or internal transfer of the same set
+/// of notes minted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Burn {
     pub id: String,
     pub id2: Option<String>,
     pub amount1_msat: u64,
     pub amount2_msat: Option<u64>,
+    /// The username an internal transfer credited, which picked `id` itself.
+    pub to_username: Option<String>,
 }
+
+/// A registered share's note `Q` at an index, as hex, from the `cx1` on file:
+/// `None` for an index that derives no key.
+pub type DeriveNote<'a> = &'a dyn Fn(&str, u32) -> Option<String>;
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct Stats {
@@ -173,9 +189,25 @@ impl NoteStore {
             ("mints", "zap_request", "TEXT"),
             ("mints", "zap_receipt", "TEXT"),
             ("usernames", "nostr_pubkey", "TEXT"),
+            // an address mint picks its note when the payment settles, so its
+            // invoice's preimage is keyed by `label` instead (LUD-26)
+            ("mints", "username", "TEXT"),
+            ("mints", "label", "TEXT"),
+            ("burns", "to_username", "TEXT"),
         ] {
             add_column_if_missing(&conn, table, column, ddl)?;
         }
+        // Every share key this mint ever accepted, so none is registered
+        // twice and a captured proof never applies again (LUD-26). A cx1 on
+        // file is hex(x(P) || chain code) from before LUD-26 (64 bytes), or
+        // hex(chain code || P) (65 bytes).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS accepted_keys (xp TEXT PRIMARY KEY);
+             INSERT OR IGNORE INTO accepted_keys (xp)
+                SELECT CASE WHEN length(cx1) = 128 THEN substr(cx1, 1, 64)
+                            ELSE substr(cx1, 67, 64) END
+                FROM usernames;",
+        )?;
         // only once note_id is certain to exist
         conn.execute_batch("CREATE INDEX IF NOT EXISTS mints_note_id ON mints (note_id);")?;
         Ok(NoteStore {
@@ -214,24 +246,70 @@ impl NoteStore {
         Ok(())
     }
 
+    /// Record an invoice that, once paid, credits `amount_msat` to the next
+    /// unused note of `username`'s share. The note is picked when the payment
+    /// settles, never now, so an unpaid invoice leaves no unused index
+    /// (LUD-26). `label` keys the invoice's preimage.
+    pub fn create_address_mint(
+        &self,
+        payment_hash: &str,
+        pr: &str,
+        amount_msat: u64,
+        username: &str,
+        label: &str,
+    ) -> StoreResult<()> {
+        self.conn().execute(
+            "INSERT INTO mints (payment_hash, pr, amount_msat, username, label, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                payment_hash,
+                pr,
+                amount_msat as i64,
+                username,
+                label,
+                now() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Turn a paid mint invoice into an outstanding note. Returns its note id
-    /// and value, or `None` if it was already settled (or is unknown).
-    pub fn settle_mint(&self, payment_hash: &str) -> StoreResult<Option<(String, u64)>> {
+    /// and value, or `None` if it was already settled (or is unknown). An
+    /// address mint picks its note now, with `derive`.
+    pub fn settle_mint(
+        &self,
+        payment_hash: &str,
+        derive: DeriveNote<'_>,
+    ) -> StoreResult<Option<(String, u64)>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE mints SET minted = 1
-             WHERE payment_hash = ?1 AND minted = 0 AND note_id IS NOT NULL",
+             WHERE payment_hash = ?1 AND minted = 0
+               AND (note_id IS NOT NULL OR username IS NOT NULL)",
             [payment_hash],
         )?;
         if changed != 1 {
             return Ok(None);
         }
-        let (amount_msat, note_id): (i64, String) = tx.query_row(
-            "SELECT amount_msat, note_id FROM mints WHERE payment_hash = ?1",
-            [payment_hash],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (amount_msat, note_id, username): (i64, Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT amount_msat, note_id, username FROM mints WHERE payment_hash = ?1",
+                [payment_hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let note_id = match (note_id, username) {
+            (Some(note_id), _) => note_id,
+            (None, Some(username)) => {
+                let (note_id, _) = claim_index(&tx, &username, derive)?;
+                tx.execute(
+                    "UPDATE mints SET note_id = ?1 WHERE payment_hash = ?2",
+                    params![note_id, payment_hash],
+                )?;
+                note_id
+            }
+            (None, None) => unreachable!("selected for a note id or a username"),
+        };
         tx.execute(
             "INSERT INTO notes (id, amount_msat, locked_at) VALUES (?1, ?2, ?3)",
             params![note_id, amount_msat, now() as i64],
@@ -317,53 +395,32 @@ impl NoteStore {
     pub fn swap(&self, burn_ids: &[String], outputs: &[(String, u64)]) -> StoreResult<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let mut seen = HashSet::new();
-        for id in burn_ids {
-            if !seen.insert(id) {
-                return Err(StoreError::Invalid);
-            }
-            let pending: Option<i64> = tx
-                .query_row(
-                    "SELECT pending FROM notes WHERE id = ?1 AND spent = 0",
-                    [id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match pending {
-                None => return Err(StoreError::Invalid),
-                Some(p) if p != 0 => return Err(StoreError::Pending),
-                _ => {}
-            }
-        }
-        let mut seen = HashSet::new();
-        for (id, _) in outputs {
-            if !seen.insert(id) || id_in_use(&tx, id)? {
-                return Err(StoreError::InUse);
-            }
-        }
-        for id in burn_ids {
-            tx.execute("UPDATE notes SET spent = 1 WHERE id = ?1", [id])?;
-        }
-        let locked_at = now() as i64;
-        for (id, amount) in outputs {
-            tx.execute(
-                "INSERT INTO notes (id, amount_msat, locked_at) VALUES (?1, ?2, ?3)",
-                params![id, *amount as i64, locked_at],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO burns (burn_key, id, id2, amount1_msat, amount2_msat)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                burn_key(burn_ids),
-                outputs[0].0,
-                outputs.get(1).map(|o| o.0.clone()),
-                outputs[0].1 as i64,
-                outputs.get(1).map(|o| o.1 as i64),
-            ],
-        )?;
+        swap_in(&tx, burn_ids, outputs, None)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// LUD-26's internal transfer: atomically burn `burn_ids` and credit
+    /// `amount_msat` to the next unused note of `username`'s share. Returns
+    /// the note credited.
+    pub fn transfer_to_username(
+        &self,
+        burn_ids: &[String],
+        username: &str,
+        amount_msat: u64,
+        derive: DeriveNote<'_>,
+    ) -> StoreResult<String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let (note_id, _) = claim_index(&tx, username, derive)?;
+        swap_in(
+            &tx,
+            burn_ids,
+            &[(note_id.clone(), amount_msat)],
+            Some(username),
+        )?;
+        tx.commit()?;
+        Ok(note_id)
     }
 
     /// The outputs of an earlier rotate/split/merge of exactly this set of notes.
@@ -371,7 +428,8 @@ impl NoteStore {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, id2, amount1_msat, amount2_msat FROM burns WHERE burn_key = ?1",
+                "SELECT id, id2, amount1_msat, amount2_msat, to_username FROM burns
+                 WHERE burn_key = ?1",
                 [burn_key(note_ids)],
                 |row| {
                     Ok(Burn {
@@ -379,6 +437,7 @@ impl NoteStore {
                         id2: row.get(1)?,
                         amount1_msat: row.get::<_, i64>(2)? as u64,
                         amount2_msat: row.get::<_, Option<i64>>(3)?.map(|a| a as u64),
+                        to_username: row.get(4)?,
                     })
                 },
             )
@@ -503,20 +562,22 @@ impl NoteStore {
         Ok(self
             .conn()
             .query_row(
-                "SELECT note_id FROM mints
-                 WHERE payment_hash = ?1 AND minted = 0 AND note_id IS NOT NULL",
+                "SELECT COALESCE(label, note_id) FROM mints
+                 WHERE payment_hash = ?1 AND minted = 0
+                   AND (note_id IS NOT NULL OR username IS NOT NULL)",
                 [payment_hash],
                 |row| row.get(0),
             )
             .optional()?)
     }
 
-    /// The note a mint invoice credits, settled or not.
-    pub fn mint_note_id(&self, payment_hash: &str) -> StoreResult<Option<String>> {
+    /// What a mint invoice's preimage is keyed by: the note it credits, or
+    /// for an address mint its label.
+    pub fn mint_preimage_label(&self, payment_hash: &str) -> StoreResult<Option<String>> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT note_id FROM mints WHERE payment_hash = ?1",
+                "SELECT COALESCE(label, note_id) FROM mints WHERE payment_hash = ?1",
                 [payment_hash],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -572,20 +633,49 @@ impl NoteStore {
 
     // ---- usernames (LUD-26) ----
 
-    /// Claim `username` for a branch, or replace an existing claim wholesale.
-    /// The caller has already checked the ownership proof.
-    pub fn upsert_username(
+    /// Register `username` for a share. Never overwrites: a registered
+    /// username is `AlreadyRegistered`, and a share key this mint accepted
+    /// before is `KeyUsed`. The caller has already checked the proof.
+    pub fn register_username(
         &self,
         username: &str,
         cx1_hex: &str,
+        xp_hex: &str,
         nostr_pubkey_hex: Option<&str>,
     ) -> StoreResult<()> {
-        self.conn().execute(
-            "INSERT INTO usernames (username, cx1, nostr_pubkey, next_index) VALUES (?1, ?2, ?3, 0)
-             ON CONFLICT(username) DO UPDATE SET
-                cx1 = excluded.cx1, nostr_pubkey = excluded.nostr_pubkey, next_index = 0",
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usernames WHERE username = ?1)",
+            [username],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(StoreError::AlreadyRegistered);
+        }
+        accept_key(&tx, xp_hex)?;
+        tx.execute(
+            "INSERT INTO usernames (username, cx1, nostr_pubkey, next_index) VALUES (?1, ?2, ?3, 0)",
             params![username, cx1_hex, nostr_pubkey_hex],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Move a registered `username` to a new share without ever freeing it
+    /// (LUD-26's PUT). Auto-mint starts over at the new share's index 0.
+    pub fn update_username(&self, username: &str, cx1_hex: &str, xp_hex: &str) -> StoreResult<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        accept_key(&tx, xp_hex)?;
+        let changed = tx.execute(
+            "UPDATE usernames SET cx1 = ?1, next_index = 0 WHERE username = ?2",
+            params![cx1_hex, username],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::UnknownUser);
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -629,53 +719,109 @@ impl NoteStore {
             .optional()?
             .flatten())
     }
+}
 
-    pub fn next_index_hint(&self, username: &str) -> StoreResult<Option<u32>> {
-        Ok(self
-            .conn()
+/// Burn `burn_ids` and mint `outputs` inside `tx`, recording the burn so a
+/// retry is answered with the same result. `to_username` marks an internal
+/// transfer, whose output the mint picked.
+fn swap_in(
+    tx: &rusqlite::Transaction<'_>,
+    burn_ids: &[String],
+    outputs: &[(String, u64)],
+    to_username: Option<&str>,
+) -> StoreResult<()> {
+    let mut seen = HashSet::new();
+    for id in burn_ids {
+        if !seen.insert(id) {
+            return Err(StoreError::Invalid);
+        }
+        let pending: Option<i64> = tx
             .query_row(
-                "SELECT next_index FROM usernames WHERE username = ?1",
-                [username],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|i| i as u32))
-    }
-
-    /// Reserve (and persist past) the next free index on `username`'s branch.
-    pub fn claim_next_index(
-        &self,
-        username: &str,
-        derive: impl Fn(u32) -> Option<String>,
-    ) -> StoreResult<(String, u32)> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let Some(start): Option<i64> = tx
-            .query_row(
-                "SELECT next_index FROM usernames WHERE username = ?1",
-                [username],
+                "SELECT pending FROM notes WHERE id = ?1 AND spent = 0",
+                [id],
                 |row| row.get(0),
             )
-            .optional()?
-        else {
-            return Err(StoreError::Invalid);
-        };
-        let mut index = start as u32;
-        let note_id = loop {
-            if let Some(id) = derive(index) {
-                if !id_in_use(&tx, &id)? {
-                    break id;
-                }
-            }
-            index = index.checked_add(1).ok_or(StoreError::InUse)?;
-        };
-        tx.execute(
-            "UPDATE usernames SET next_index = ?1 WHERE username = ?2",
-            params![i64::from(index) + 1, username],
-        )?;
-        tx.commit()?;
-        Ok((note_id, index))
+            .optional()?;
+        match pending {
+            None => return Err(StoreError::Invalid),
+            Some(p) if p != 0 => return Err(StoreError::Pending),
+            _ => {}
+        }
     }
+    let mut seen = HashSet::new();
+    for (id, _) in outputs {
+        if !seen.insert(id) || id_in_use(tx, id)? {
+            return Err(StoreError::InUse);
+        }
+    }
+    for id in burn_ids {
+        tx.execute("UPDATE notes SET spent = 1 WHERE id = ?1", [id])?;
+    }
+    let locked_at = now() as i64;
+    for (id, amount) in outputs {
+        tx.execute(
+            "INSERT INTO notes (id, amount_msat, locked_at) VALUES (?1, ?2, ?3)",
+            params![id, *amount as i64, locked_at],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO burns (burn_key, id, id2, amount1_msat, amount2_msat, to_username)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            burn_key(burn_ids),
+            outputs[0].0,
+            outputs.get(1).map(|o| o.0.clone()),
+            outputs[0].1 as i64,
+            outputs.get(1).map(|o| o.1 as i64),
+            to_username,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Record a share key as accepted, refusing one accepted before.
+fn accept_key(tx: &rusqlite::Transaction<'_>, xp_hex: &str) -> StoreResult<()> {
+    let fresh = tx.execute(
+        "INSERT OR IGNORE INTO accepted_keys (xp) VALUES (?1)",
+        [xp_hex],
+    )?;
+    if fresh != 1 {
+        return Err(StoreError::KeyUsed);
+    }
+    Ok(())
+}
+
+/// Claim (and persist past) the next unused index on `username`'s share,
+/// skipping any whose note is outstanding, burned or another mint's output.
+fn claim_index(
+    tx: &rusqlite::Transaction<'_>,
+    username: &str,
+    derive: DeriveNote<'_>,
+) -> StoreResult<(String, u32)> {
+    let Some((cx1_hex, start)): Option<(String, i64)> = tx
+        .query_row(
+            "SELECT cx1, next_index FROM usernames WHERE username = ?1",
+            [username],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+    else {
+        return Err(StoreError::UnknownUser);
+    };
+    let mut index = start as u32;
+    let note_id = loop {
+        if let Some(id) = derive(&cx1_hex, index) {
+            if !id_in_use(tx, &id)? {
+                break id;
+            }
+        }
+        index = index.checked_add(1).ok_or(StoreError::InUse)?;
+    };
+    tx.execute(
+        "UPDATE usernames SET next_index = ?1 WHERE username = ?2",
+        params![i64::from(index) + 1, username],
+    )?;
+    Ok((note_id, index))
 }
 
 /// Whether `note_id` names a note (spent or not) or some mint's output.
@@ -766,10 +912,15 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A settlement with no registered share to credit.
+    fn no_share(_: &str, _: u32) -> Option<String> {
+        None
+    }
+
     fn minted(store: &NoteStore, hash: &str, id: &str, amount: u64) {
         store.create_mint(hash, "lnbc", amount, id).unwrap();
         assert_eq!(
-            store.settle_mint(hash).unwrap(),
+            store.settle_mint(hash, &no_share).unwrap(),
             Some((id.to_string(), amount))
         );
     }
@@ -791,7 +942,10 @@ mod tests {
         let store = NoteStore::init(oldest).unwrap();
         assert_eq!(store.note_record("aa").unwrap().unwrap().amount_msat, 5000);
         store.create_mint("h1", "lnbc", 7000, "bb").unwrap();
-        assert_eq!(store.settle_mint("h1").unwrap(), Some(("bb".into(), 7000)));
+        assert_eq!(
+            store.settle_mint("h1", &no_share).unwrap(),
+            Some(("bb".into(), 7000))
+        );
 
         let renamed = Connection::open_in_memory().unwrap();
         renamed
@@ -816,7 +970,10 @@ mod tests {
             store.pending_mint_by_note_id("cc").unwrap().as_deref(),
             Some("h2")
         );
-        assert_eq!(store.settle_mint("h2").unwrap(), Some(("cc".into(), 9000)));
+        assert_eq!(
+            store.settle_mint("h2", &no_share).unwrap(),
+            Some(("cc".into(), 9000))
+        );
         // and a burn from before still answers its retry
         let burn = store.find_burn(&ids(&["dd"])).unwrap().unwrap();
         assert_eq!((burn.id.as_str(), burn.amount1_msat), ("ee", 4000));
@@ -826,7 +983,7 @@ mod tests {
     fn mint_settles_once() {
         let store = NoteStore::in_memory().unwrap();
         minted(&store, "h1", "q1", 5000);
-        assert_eq!(store.settle_mint("h1").unwrap(), None);
+        assert_eq!(store.settle_mint("h1", &no_share).unwrap(), None);
         let record = store.note_record("q1").unwrap().unwrap();
         assert_eq!(record.amount_msat, 5000);
         assert!(!record.spent);
@@ -915,26 +1072,132 @@ mod tests {
         store.create_mint("h1", "lnbc", 5000, "q1").unwrap();
         assert_eq!(store.claimable("h1").unwrap().as_deref(), Some("q1"));
         assert_eq!(store.claimable("nobody").unwrap(), None);
-        store.settle_mint("h1").unwrap();
+        store.settle_mint("h1", &no_share).unwrap();
         // a second payment of a paid invoice is failed back
         assert_eq!(store.claimable("h1").unwrap(), None);
-        assert_eq!(store.mint_note_id("h1").unwrap().as_deref(), Some("q1"));
+        assert_eq!(
+            store.mint_preimage_label("h1").unwrap().as_deref(),
+            Some("q1")
+        );
+    }
+
+    /// The share note `k<i>` at index `i`.
+    fn share_note(_: &str, index: u32) -> Option<String> {
+        Some(format!("k{index}"))
     }
 
     #[test]
-    fn address_indices_skip_keys_in_use() {
+    fn an_address_mint_picks_its_note_when_it_settles() {
         let store = NoteStore::in_memory().unwrap();
-        store.upsert_username("alice", "00", None).unwrap();
-        minted(&store, "h1", "k0", 1000);
-        let (id, index) = store
-            .claim_next_index("alice", |i| Some(format!("k{i}")))
+        store.register_username("alice", "00", "x0", None).unwrap();
+        // two invoices, neither paid: no index is taken yet
+        store
+            .create_address_mint("h1", "lnbc", 1000, "alice", "a1")
             .unwrap();
-        assert_eq!((id.as_str(), index), ("k1", 1));
-        assert_eq!(store.next_index_hint("alice").unwrap(), Some(2));
-        let (id, _) = store
-            .claim_next_index("alice", |i| Some(format!("k{i}")))
+        store
+            .create_address_mint("h2", "lnbc", 2000, "alice", "a2")
             .unwrap();
-        store.create_mint("h2", "lnbc", 7, &id).unwrap();
-        assert!(store.pending_mint_by_note_id("k2").unwrap().is_some());
+        assert_eq!(store.claimable("h1").unwrap().as_deref(), Some("a1"));
+        assert_eq!(
+            store.mint_preimage_label("h2").unwrap().as_deref(),
+            Some("a2")
+        );
+        // k0 is somebody's already, so the first to settle skips it
+        minted(&store, "h0", "k0", 1);
+        assert_eq!(
+            store.settle_mint("h2", &share_note).unwrap(),
+            Some(("k1".into(), 2000))
+        );
+        assert_eq!(
+            store.settle_mint("h1", &share_note).unwrap(),
+            Some(("k2".into(), 1000))
+        );
+        assert_eq!(store.settle_mint("h1", &share_note).unwrap(), None);
+        assert_eq!(store.claimable("h1").unwrap(), None);
+    }
+
+    #[test]
+    fn a_transfer_burns_and_credits_the_next_share_note_at_once() {
+        let store = NoteStore::in_memory().unwrap();
+        store.register_username("alice", "00", "x0", None).unwrap();
+        minted(&store, "h1", "q1", 5000);
+        let credited = store
+            .transfer_to_username(&ids(&["q1"]), "alice", 5000, &share_note)
+            .unwrap();
+        assert_eq!(credited, "k0");
+        assert!(store.note_record("q1").unwrap().unwrap().spent);
+        assert_eq!(store.note_record("k0").unwrap().unwrap().amount_msat, 5000);
+        let burn = store.find_burn(&ids(&["q1"])).unwrap().unwrap();
+        assert_eq!(burn.to_username.as_deref(), Some("alice"));
+        // a spent note transfers nothing, and takes no index
+        assert!(matches!(
+            store.transfer_to_username(&ids(&["q1"]), "alice", 5000, &share_note),
+            Err(StoreError::Invalid)
+        ));
+        minted(&store, "h2", "q2", 1);
+        assert_eq!(
+            store
+                .transfer_to_username(&ids(&["q2"]), "alice", 1, &share_note)
+                .unwrap(),
+            "k1"
+        );
+        assert!(matches!(
+            store.transfer_to_username(&ids(&["q2"]), "bob", 1, &share_note),
+            Err(StoreError::UnknownUser)
+        ));
+    }
+
+    #[test]
+    fn a_username_is_never_overwritten_and_a_share_never_reused() {
+        let store = NoteStore::in_memory().unwrap();
+        store.register_username("alice", "00", "x0", None).unwrap();
+        assert!(matches!(
+            store.register_username("alice", "01", "x1", None),
+            Err(StoreError::AlreadyRegistered)
+        ));
+        assert!(matches!(
+            store.register_username("bob", "00", "x0", None),
+            Err(StoreError::KeyUsed)
+        ));
+        store.update_username("alice", "01", "x1").unwrap();
+        assert_eq!(
+            store.username_branch("alice").unwrap().as_deref(),
+            Some("01")
+        );
+        assert!(matches!(
+            store.update_username("alice", "00", "x0"),
+            Err(StoreError::KeyUsed)
+        ));
+        assert!(matches!(
+            store.update_username("bob", "02", "x2"),
+            Err(StoreError::UnknownUser)
+        ));
+        store.delete_username("alice").unwrap();
+        assert!(matches!(
+            store.register_username("alice", "01", "x1", None),
+            Err(StoreError::KeyUsed)
+        ));
+    }
+
+    /// A share registered before the table of accepted keys existed is in
+    /// it once the store opens: both cx1 shapes on file.
+    #[test]
+    fn shares_on_file_are_accepted_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        let legacy = format!("{}{}", "aa".repeat(32), "cc".repeat(32));
+        let current = format!("{}02{}", "cc".repeat(32), "bb".repeat(32));
+        conn.execute_batch(&format!(
+            "CREATE TABLE usernames (username TEXT PRIMARY KEY, cx1 TEXT NOT NULL,
+                next_index INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO usernames (username, cx1) VALUES ('old', '{legacy}'), ('new', '{current}');"
+        ))
+        .unwrap();
+        let store = NoteStore::init(conn).unwrap();
+        for xp in ["aa".repeat(32), "bb".repeat(32)] {
+            assert!(matches!(
+                store.register_username("carol", "ff", &xp, None),
+                Err(StoreError::KeyUsed)
+            ));
+        }
     }
 }

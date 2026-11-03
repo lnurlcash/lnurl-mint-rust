@@ -270,11 +270,13 @@ user and password in an environment file.
 
 | | |
 |---|---|
-| `GET /.well-known/lnurlp/<username>` | LUD-16 payRequest with `withdrawLink`. `_` and `USERNAME` are the mint itself; a registered username also carries `text/cpub`. |
+| `GET /.well-known/lnurlp/<username>` | LUD-16 payRequest with `withdrawLink`. `_`, `mint` and `USERNAME` are the mint itself; a registered username is an ordinary Lightning Address (`<username>+<tag>` too) with no `commentAllowed`. |
+| `POST /.well-known/lnurlp/<username>` | LUD-26 register, form body `cx1=&sig=[&npub=]`: `sig` by the share's own key. Never overwrites, and a share is never accepted twice. |
+| `PUT /.well-known/lnurlp/<username>` | LUD-26 update to a new share, form body `cx1=&sig=&newsig=`: `sig` by the key on file, `newsig` by the new share. |
+| `DELETE /.well-known/lnurlp/<username>` | LUD-26 unregister, form body `sig=` by the key on file. |
 | `GET /p/cb?amount=&comment=` | Mint: `comment` is `cp1<Q>` or a bearer note's hex `h`. |
-| `GET /p/<username>?amount=` | Auto-mint onto a registered branch (purpose 2). |
-| `POST /p/<username>?cx1=&sig=[&npub=]` | Register a username, or overwrite one (proven by the branch on file). |
-| `DELETE /p/<username>?sig=` | Unregister. |
+| `GET /p/<username>?amount=` | Auto-mint: once paid, credits the share's next unused note. |
+| `GET /p/<username>?amount=&k1=` | LUD-26 internal transfer: burns the note (`amount` its full value) and credits it, free of fees, to the share's next unused note. |
 | `GET /w?k1=<spend>` / `GET /w?p=<cp1 or h>` | Informational withdrawRequest; never burns. |
 | `GET /w/cb` | Melt (`k1`, `pr`), rotate (`k1`, `p1`), split (`k1`…, `amount`, `p1`, `p2`), merge (`k1`…, `p1`). |
 | `GET /verify/<payment_hash>` | LUD-21, for mint invoices and melts. |
@@ -352,7 +354,7 @@ routes, without that check, are on the admin socket the CLI uses:
 | `GET /note/<cp1 or h>` | A note's status and value. |
 | `GET /pending` | Notes reserved by in-flight melts, by payment hash. |
 | `POST /reconcile` | Resolve pending melts now. |
-| `GET /users` | Registered usernames, their `cx1` and next index. |
+| `GET /users` | Registered usernames, their `cx1` (`legacy` for one registered before LUD-26) and next index. |
 | `GET /node/balance` | On-chain and Lightning balances. |
 | `POST /node/address` | A fresh address to fund the wallet. |
 | `GET /node/peers`, `POST /node/peers` `{"peer": "pubkey@host:port"}` | List or connect peers. |

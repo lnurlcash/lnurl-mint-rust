@@ -387,7 +387,7 @@ def electrum(b: "Mint") -> None:
     wait_for(lambda: e.get(f"/w?k1={k1}").get("maxWithdrawable") == 39_000, "note minted on E", 60)
     out = b.admin_post("/node/invoice", {"amount_msat": 39_000, "description": "e melt"})
     assert e.get(f"/w/cb?k1={k1}&pr={out['bolt11']}")["status"] == "OK"
-    wait_for(lambda: e.get(f"/w?k1={k1}").get("reason") == "Note already spent.", "E's melt settled", 60)
+    wait_for(lambda: e.get(f"/w?k1={k1}").get("reason") == "already in use", "E's melt settled", 60)
     assert b.admin_get(f"/node/invoice/{out['payment_hash']}")["paid"] is True
     log("E minted a note paid by B and melted it back to B")
     e.stop()
@@ -542,7 +542,7 @@ def main() -> None:
     out = b.admin_post("/node/invoice", {"amount_msat": 99_000, "description": "melt"})
     melt = a.get(f"/w/cb?k1={k1b}&pr={out['bolt11']}")
     assert melt["status"] == "OK", melt
-    wait_for(lambda: a.get(f"/w?k1={k1b}").get("reason") == "Note already spent.", "note burned")
+    wait_for(lambda: a.get(f"/w?k1={k1b}").get("reason") == "already in use", "note burned")
     verify = a.get(melt["verify"].removeprefix(a.base))
     assert (
         verify["settled"] is True
@@ -584,7 +584,7 @@ def main() -> None:
     a.start()
     wait_for(lambda: a.admin_get("/pending")["pending_melts"] == {}, "unsent melt reconciled", 180)
     assert b.admin_get(f"/node/invoice/{unsent['payment_hash']}")["paid"] is True
-    assert a.get(f"/w?k1={k1c}").get("reason") == "Note already spent."
+    assert a.get(f"/w?k1={k1c}").get("reason") == "already in use"
     log("restarted A after a crash before sending: the melt was sent then, B paid, note burned")
 
     # a fresh note for the next melt
@@ -614,7 +614,7 @@ def main() -> None:
 
     wait_for(resolved, "the killed melt resolved", 300)
     b_paid = b.admin_get(f"/node/invoice/{out['payment_hash']}")["paid"]
-    spent = a.get(f"/w?k1={k1c}").get("reason") == "Note already spent."
+    spent = a.get(f"/w?k1={k1c}").get("reason") == "already in use"
     assert spent == b_paid, (spent, b_paid)
     stats = a.info()["stats"]
     log(

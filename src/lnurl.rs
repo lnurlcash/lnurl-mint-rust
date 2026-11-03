@@ -3,8 +3,9 @@
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, RawQuery, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
@@ -18,16 +19,19 @@ use crate::{
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(frontend))
-        .route("/.well-known/lnurlp/{username}", get(lnurlp))
+        // LUD-26 registers at the very address it claims
+        .route(
+            "/.well-known/lnurlp/{username}",
+            get(lnurlp)
+                .post(register_username)
+                .put(update_username)
+                .delete(unregister_username)
+                .options(preflight),
+        )
         .route("/.well-known/lnurlw/{username}", get(lnurlw))
         .route("/.well-known/nostr.json", get(nostr_json))
         .route("/p/cb", get(pay_callback))
-        .route(
-            "/p/{username}",
-            get(pay_callback_for_username)
-                .post(register_username)
-                .delete(unregister_username),
-        )
+        .route("/p/{username}", get(pay_callback_for_username))
         .route("/verify/{payment_hash}", get(verify))
         .route("/w", get(withdraw_request))
         .route("/w/cb", get(withdraw_callback))
@@ -37,6 +41,22 @@ pub fn router(state: AppState) -> Router {
 fn respond(result: MintResult<Value>) -> Response {
     let body = result.unwrap_or_else(|e| json!({"status": "ERROR", "reason": e.reason()}));
     ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], Json(body)).into_response()
+}
+
+/// The CORS preflight a browser wallet's PUT or DELETE needs (LUD-26).
+async fn preflight() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                "GET, POST, PUT, DELETE, OPTIONS",
+            ),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type"),
+        ],
+    )
+        .into_response()
 }
 
 fn request_host(headers: &HeaderMap) -> Option<&str> {
@@ -61,6 +81,14 @@ fn query_pairs(query: Option<String>) -> Vec<(String, String)> {
     url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
         .into_owned()
         .collect()
+}
+
+/// A registration's parameters: the `application/x-www-form-urlencoded`
+/// body LUD-26 sends them in, then the query.
+fn form_pairs(body: &[u8], query: Option<String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(body).into_owned().collect();
+    pairs.extend(query_pairs(query));
+    pairs
 }
 
 fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -141,6 +169,10 @@ fn pay(
     }
     let amount = amount_param(pairs, "amount")?
         .ok_or_else(|| MintError::Reject("Missing amount.".into()))?;
+    // a note in place of an invoice: LUD-26's internal transfer
+    if let (Some(username), Some(k1)) = (username, param(pairs, "k1")) {
+        return state.internal_transfer(username, amount, k1, host);
+    }
     state.pay_callback(username, amount, param(pairs, "comment"), host)
 }
 
@@ -149,8 +181,9 @@ async fn register_username(
     Path(username): Path<String>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    let pairs = query_pairs(query);
+    let pairs = form_pairs(&body, query);
     let host = owned_host(&headers);
     respond(
         blocking(move || {
@@ -166,13 +199,37 @@ async fn register_username(
     )
 }
 
+async fn update_username(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let pairs = form_pairs(&body, query);
+    let host = owned_host(&headers);
+    respond(
+        blocking(move || {
+            state.update(
+                &username,
+                required(&pairs, "cx1")?,
+                required(&pairs, "sig")?,
+                required(&pairs, "newsig")?,
+                host.as_deref(),
+            )
+        })
+        .await,
+    )
+}
+
 async fn unregister_username(
     State(state): State<AppState>,
     Path(username): Path<String>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    let pairs = query_pairs(query);
+    let pairs = form_pairs(&body, query);
     let host = owned_host(&headers);
     respond(
         blocking(move || {
@@ -350,8 +407,14 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use lnurlcash_core::{
-        recoverable::{PURPOSE_WALLET, derive_note_secret_key, encode_cx1},
+        cash::{CashNode, derive_cash_root, derive_service_root},
+        recoverable::{
+            Cw1, LEGACY_PURPOSE_LIGHTNING_ADDRESS, cash_node_to_cx1, derive_note_pubkey,
+            derive_share_node, encode_ck1, encode_cp1, encode_cw1, encode_cx1, encode_legacy_cx1,
+            legacy_branch_node, legacy_cx1_of, legacy_derive_note_pubkey, sign_note_ownership,
+        },
         signature::sign_address_proof,
+        spend::{bearer_cw1, bearer_leaf, tapleaf_hash, taproot_tweak, taproot_tweak_secret_key},
     };
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
@@ -373,11 +436,18 @@ mod tests {
     }
 
     async fn call(state: &AppState, method: &str, uri: &str) -> Value {
+        form(state, method, uri, "").await
+    }
+
+    /// A request with an `application/x-www-form-urlencoded` body, as
+    /// LUD-26's registration sends one.
+    async fn form(state: &AppState, method: &str, uri: &str, body: &str) -> Value {
         let req = Request::builder()
             .method(method)
             .uri(uri)
             .header(header::HOST, "mint.example")
-            .body(Body::empty())
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_string()))
             .unwrap();
         let res = router(state.clone()).oneshot(req).await.unwrap();
         assert_eq!(res.status(), 200, "LUD-01: errors are 200s too");
@@ -412,7 +482,10 @@ mod tests {
             .store
             .create_mint(&payment_hash, "lnbcrt1", amount_msat, &note_id)
             .unwrap();
-        state.store.settle_mint(&payment_hash).unwrap();
+        state
+            .store
+            .settle_mint(&payment_hash, &|_, _| None)
+            .unwrap();
     }
 
     async fn value_of(state: &AppState, k1: &str) -> Value {
@@ -450,13 +523,18 @@ mod tests {
         // the same request again is the same rotate, not a double spend
         ok(&get(&state, &uri).await);
         assert_eq!(value_of(&state, &k1b).await, 50_000);
-        // into anything else, the burned note is gone
+        // into anything else, the burned note is gone: LUD-25 answers a
+        // burned note "already in use", which LUD-26 recovery counts as used
         let (_, hc) = bearer(3);
         let again = get(&state, &format!("/w/cb?k1={k1}&p1={hc}")).await;
-        assert_eq!(reason(&again), INVALID_K1);
+        assert_eq!(reason(&again), "already in use");
         assert_eq!(
             reason(&get(&state, &format!("/w?k1={k1}")).await),
-            "Note already spent."
+            "already in use"
+        );
+        assert_eq!(
+            reason(&get(&state, &format!("/w?p={h}")).await),
+            "already in use"
         );
     }
 
@@ -521,10 +599,108 @@ mod tests {
         let v = get(&state, &format!("/w/cb?k1={k1a}&k1={k1b}&p1={hc}")).await;
         assert_eq!(reason(&v), INVALID_K1);
         assert_eq!(value_of(&state, &k1a).await, 30_000);
-        // and naming one note twice is no merge either
+    }
+
+    const SAME_NOTE: &str = "the same note is spent twice";
+
+    /// Notes are compared as the `Q` they decode to, never as raw strings.
+    #[tokio::test]
+    async fn one_note_spent_twice_is_no_merge() {
+        let state = app();
+        let (k1a, ha) = bearer(1);
+        let (k1b, hb) = bearer(2);
+        let (_, hc) = bearer(3);
+        credit(&state, &ha, 30_000);
+        credit(&state, &hb, 20_000);
+        // the same string twice
         let v = get(&state, &format!("/w/cb?k1={k1a}&k1={k1a}&p1={hc}")).await;
-        assert_eq!(reason(&v), INVALID_K1);
+        assert_eq!(reason(&v), SAME_NOTE);
+        // a hex preimage and its cw1, alongside a real second note
+        let cw1a = encode_cw1(&bearer_cw1(&[1; 32]).unwrap()).unwrap();
+        let uri = format!("/w/cb?k1={k1a}&k1={k1b}&k1={cw1a}&p1={hc}");
+        assert_eq!(reason(&get(&state, &uri).await), SAME_NOTE);
+        // and as a split
+        let uri = format!("/w/cb?k1={cw1a}&k1={k1a}&amount=100&p1={hc}&p2={hb}");
+        assert_eq!(reason(&get(&state, &uri).await), SAME_NOTE);
+        // nothing was burned
         assert_eq!(value_of(&state, &k1a).await, 30_000);
+        assert_eq!(value_of(&state, &k1b).await, 20_000);
+        ok(&get(&state, &format!("/w/cb?k1={k1a}&k1={k1b}&p1={hc}")).await);
+    }
+
+    /// A key with a script tree: its `ck1` (tweaked key path) and its `cw1`
+    /// (the leaf) are two valid spends of one `Q`.
+    #[tokio::test]
+    async fn a_ck1_and_a_cw1_of_one_note_are_no_merge() {
+        let state = app();
+        let internal_sk = [21u8; 32];
+        let preimage = [22u8; 32];
+        let internal = secp256k1::Keypair::from_secret_bytes(internal_sk)
+            .unwrap()
+            .x_only_public_key()
+            .0
+            .to_byte_array();
+        let leaf = bearer_leaf(&Sha256::digest(preimage).into());
+        let root = tapleaf_hash(&leaf, 0xc0);
+        let tweak = taproot_tweak(&internal, &root).unwrap();
+        let q = encode_cp1(&tweak.output_key);
+        let tweaked_sk = taproot_tweak_secret_key(&internal_sk, &root).unwrap();
+        let ck1 = encode_ck1(&sign_note_ownership(&tweaked_sk, "mint.example").unwrap());
+        let mut control_block = vec![0xc0 | tweak.parity];
+        control_block.extend_from_slice(&internal);
+        let cw1 = encode_cw1(&Cw1 {
+            locktime: 0,
+            sequence: 0xffff_ffff,
+            script: leaf.to_vec(),
+            control_block,
+            witness: vec![preimage.to_vec()],
+        })
+        .unwrap();
+        credit(&state, &q, 30_000);
+        // each opens the note on its own
+        assert_eq!(value_of(&state, &ck1).await, 30_000);
+        assert_eq!(value_of(&state, &cw1).await, 30_000);
+
+        let (k1b, hb) = bearer(2);
+        let (_, hc) = bearer(3);
+        credit(&state, &hb, 20_000);
+        for uri in [
+            format!("/w/cb?k1={ck1}&k1={cw1}&p1={hc}"),
+            format!("/w/cb?k1={cw1}&k1={k1b}&k1={ck1}&p1={hc}"),
+            format!("/w/cb?k1={ck1}&k1={ck1}&p1={hc}"),
+        ] {
+            assert_eq!(reason(&get(&state, &uri).await), SAME_NOTE, "{uri}");
+        }
+        assert_eq!(value_of(&state, &ck1).await, 30_000);
+        assert_eq!(value_of(&state, &k1b).await, 20_000);
+        // a plain hex preimage and a ck1 are two notes: they merge
+        ok(&get(&state, &format!("/w/cb?k1={k1b}&k1={ck1}&p1={hc}")).await);
+        assert_eq!(value_of(&state, &bearer(3).0).await, 30_000 + 20_000 + 1000);
+        assert_eq!(
+            reason(&get(&state, &format!("/w?k1={cw1}")).await),
+            "already in use"
+        );
+    }
+
+    #[tokio::test]
+    async fn p1_and_p2_must_be_two_notes() {
+        let state = app();
+        let (k1, h) = bearer(1);
+        let (_, ha) = bearer(2);
+        credit(&state, &h, 50_000);
+        let q: [u8; 32] = hex::decode(spend::note_id_of_ref(&ha).unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let cp1 = encode_cp1(&q);
+        for (p1, p2) in [(&ha, &ha), (&ha, &cp1), (&cp1, &ha)] {
+            let uri = format!("/w/cb?k1={k1}&amount=100&p1={p1}&p2={p2}");
+            assert_eq!(
+                reason(&get(&state, &uri).await),
+                "p1 and p2 are the same note"
+            );
+        }
+        assert_eq!(value_of(&state, &k1).await, 50_000);
     }
 
     #[tokio::test]
@@ -594,64 +770,285 @@ mod tests {
             assert!(metadata.to_string().contains("Mint fees: 1000,2000"));
         }
         let v = get(&state, "/.well-known/lnurlp/nobody").await;
-        assert_eq!(reason(&v), "Unknown user.");
+        assert_eq!(reason(&v), "unknown user");
+    }
+
+    /// A wallet's LUD-26 tree at mint.example: its root `S`, and its shares.
+    fn service_root() -> CashNode {
+        derive_service_root(&derive_cash_root(&[7; 32]).unwrap(), "mint.example").unwrap()
+    }
+
+    fn share(n: u32) -> (CashNode, String) {
+        let node = derive_share_node(&service_root(), 0, n).unwrap();
+        let cx1 = encode_cx1(&cash_node_to_cx1(&node).unwrap());
+        (node, cx1)
+    }
+
+    fn proof(key: &CashNode, action: &str, username: &str, cx1: Option<&str>) -> String {
+        hex::encode(
+            sign_address_proof(&key.private_key, action, "mint.example", username, cx1).unwrap(),
+        )
+    }
+
+    async fn register(state: &AppState, username: &str, n: u32) -> Value {
+        let (key, cx1) = share(n);
+        let sig = proof(&key, "register", username, Some(&cx1));
+        form(
+            state,
+            "POST",
+            &format!("/.well-known/lnurlp/{username}"),
+            &format!("cx1={cx1}&sig={sig}"),
+        )
+        .await
     }
 
     #[tokio::test]
-    async fn a_registered_address_advertises_its_branch() {
+    async fn a_share_registers_at_its_address_and_never_twice() {
         let state = app();
-        let branch_sk = [11u8; 32];
-        let chain_code = [2u8; 32];
-        let kp = secp256k1::Keypair::from_secret_bytes(branch_sk).unwrap();
-        let point = kp.x_only_public_key().0.to_byte_array();
-        let cx1 = encode_cx1(&point, &chain_code);
-        let sk0 = derive_note_secret_key(&branch_sk, &chain_code, PURPOSE_WALLET, 0).unwrap();
-        let sig = |action: &str| {
-            hex::encode(sign_address_proof(&sk0, action, "mint.example", "alice").unwrap())
-        };
+        let (key0, cx1_0) = share(0);
         let npub = "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg";
+        let uri = "/.well-known/lnurlp/alice";
 
-        let bad = call(
+        // a proof for another action, username or cx1 proves nothing
+        for sig in [
+            proof(&key0, "unregister", "alice", None),
+            proof(&key0, "register", "bob", Some(&cx1_0)),
+            proof(&key0, "register", "alice", Some(&share(1).1)),
+        ] {
+            let bad = form(&state, "POST", uri, &format!("cx1={cx1_0}&sig={sig}")).await;
+            assert_eq!(reason(&bad), "Invalid ownership signature.");
+        }
+        let sig = proof(&key0, "register", "alice", Some(&cx1_0));
+        ok(&form(
             &state,
             "POST",
-            &format!("/p/alice?cx1={cx1}&sig={}", sig("unregister")),
+            uri,
+            &format!("cx1={cx1_0}&sig={sig}&npub={npub}"),
         )
-        .await;
-        assert_eq!(reason(&bad), "Invalid ownership signature.");
-        let reg = format!("/p/alice?cx1={cx1}&sig={}&npub={npub}", sig("register"));
-        ok(&call(&state, "POST", &reg).await);
+        .await);
 
-        let v = get(&state, "/.well-known/lnurlp/Alice").await;
-        assert_eq!(v["callback"], "https://mint.example/p/alice");
-        assert!(v.get("commentAllowed").is_none());
-        assert!(
-            v["metadata"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("{cx1}:0"))
-        );
+        // an ordinary Lightning Address: no comment, no cx1 in sight, and a
+        // +tag lands on the same share
+        for name in ["Alice", "alice+coffee"] {
+            let v = get(&state, &format!("/.well-known/lnurlp/{name}")).await;
+            assert_eq!(v["callback"], "https://mint.example/p/alice", "{name}");
+            assert_eq!(v["withdrawLink"], "https://mint.example/w");
+            assert!(v.get("commentAllowed").is_none());
+            let metadata = v["metadata"].as_str().unwrap();
+            assert!(!metadata.contains("text/cpub") && !metadata.contains("cx1"));
+            assert!(metadata.contains("Mint fees: 1000,2000"));
+        }
         let v = get(&state, "/.well-known/nostr.json?name=alice").await;
         assert_eq!(
             v["names"]["alice"],
             "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e"
         );
 
-        let reserved = call(&state, "POST", &format!("/p/mint?cx1={cx1}&sig=00")).await;
-        assert_eq!(reason(&reserved), "Invalid or reserved username.");
-
-        ok(&call(
-            &state,
-            "DELETE",
-            &format!("/p/alice?sig={}", sig("unregister")),
-        )
-        .await);
+        // never overwritten, and a share is never registered twice
         assert_eq!(
-            reason(&get(&state, "/.well-known/lnurlp/alice").await),
-            "Unknown user."
+            reason(&register(&state, "alice", 1).await),
+            "already registered"
         );
+        assert_eq!(
+            reason(&register(&state, "bob", 0).await),
+            "cx1 already used"
+        );
+        // mint@ is the mint's own payRequest, and + is never in a username
+        for name in ["mint", "a+b"] {
+            assert_eq!(
+                reason(&register(&state, name, 2).await),
+                "Invalid or reserved username."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_put_moves_the_address_and_a_delete_frees_it() {
+        let state = app();
+        ok(&register(&state, "alice", 0).await);
+        let (key0, _) = share(0);
+        let (key1, cx1_1) = share(1);
+        let uri = "/.well-known/lnurlp/alice";
+        let update = |sig: &str, newsig: &str| format!("cx1={cx1_1}&sig={sig}&newsig={newsig}");
+
+        let newsig = proof(&key1, "register", "alice", Some(&cx1_1));
+        // the key on file must sign the update, over the new cx1
+        for sig in [
+            proof(&key1, "update", "alice", Some(&cx1_1)),
+            proof(&key0, "update", "alice", Some(&share(2).1)),
+        ] {
+            let v = form(&state, "PUT", uri, &update(&sig, &newsig)).await;
+            assert_eq!(reason(&v), "Invalid ownership signature.");
+        }
+        let sig = proof(&key0, "update", "alice", Some(&cx1_1));
+        // and the new share its own register message
+        let v = form(&state, "PUT", uri, &update(&sig, &sig)).await;
+        assert_eq!(reason(&v), "Invalid ownership signature.");
+        ok(&form(&state, "PUT", uri, &update(&sig, &newsig)).await);
+        let v = form(
+            &state,
+            "PUT",
+            "/.well-known/lnurlp/bob",
+            &update(&sig, &newsig),
+        )
+        .await;
+        assert_eq!(reason(&v), "unknown user");
+
+        // only the key now on file frees it
+        let old = proof(&key0, "unregister", "alice", None);
+        assert_eq!(
+            reason(&form(&state, "DELETE", uri, &format!("sig={old}")).await),
+            "Invalid ownership signature."
+        );
+        let sig = proof(&key1, "unregister", "alice", None);
+        ok(&form(&state, "DELETE", uri, &format!("sig={sig}")).await);
+        assert_eq!(reason(&get(&state, uri).await), "unknown user");
         assert_eq!(
             get(&state, "/.well-known/nostr.json?name=alice").await["names"],
             json!({})
+        );
+        // free again, but neither share can be registered a second time
+        assert_eq!(
+            reason(&register(&state, "alice", 0).await),
+            "cx1 already used"
+        );
+        assert_eq!(
+            reason(&register(&state, "alice", 1).await),
+            "cx1 already used"
+        );
+        ok(&register(&state, "alice", 2).await);
+    }
+
+    #[tokio::test]
+    async fn a_browser_wallet_gets_its_preflight() {
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/.well-known/lnurlp/alice")
+            .body(Body::empty())
+            .unwrap();
+        let res = router(app()).oneshot(req).await.unwrap();
+        let headers = res.headers();
+        assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        let methods = headers[header::ACCESS_CONTROL_ALLOW_METHODS]
+            .to_str()
+            .unwrap();
+        assert!(methods.contains("PUT") && methods.contains("DELETE"));
+    }
+
+    #[tokio::test]
+    async fn an_internal_transfer_credits_the_payees_next_share_note() {
+        let state = app();
+        ok(&register(&state, "alice", 0).await);
+        let watched = lnurlcash_core::recoverable::decode_cx1(&share(0).1).unwrap();
+        let note = |i| encode_cp1(&derive_note_pubkey(&watched, i).unwrap());
+
+        let (k1, h) = bearer(1);
+        credit(&state, &h, 30_000);
+        // the whole note, never part of it
+        let part = get(&state, &format!("/p/alice?amount=20000&k1={k1}")).await;
+        assert!(reason(&part).contains("full value"));
+        let uri = format!("/p/alice+tip?amount=30000&k1={k1}");
+        ok(&get(&state, &uri).await);
+        // free of fees, at share note 0, and the note it came from is burned
+        assert_eq!(
+            get(&state, &format!("/w?p={}", note(0))).await["maxWithdrawable"],
+            30_000
+        );
+        assert_eq!(
+            reason(&get(&state, &format!("/w?k1={k1}")).await),
+            "already in use"
+        );
+        // a retry is answered as the first, and credits nothing more
+        ok(&get(&state, &uri).await);
+        assert_eq!(
+            reason(&get(&state, &format!("/w?p={}", note(1))).await),
+            "Unknown note."
+        );
+
+        // the next transfer skips a share note somebody already holds
+        let (_, taken) = bearer(9);
+        let (k1b, hb) = bearer(2);
+        credit(&state, &hb, 20_000);
+        let q1 = spend::note_id_of_ref(&note(1)).unwrap();
+        let payment_hash = hex::encode(Sha256::digest(taken.as_bytes()));
+        state
+            .store
+            .create_mint(&payment_hash, "lnbcrt1", 1, &q1)
+            .unwrap();
+        ok(&get(&state, &format!("/p/alice?amount=20000&k1={k1b}")).await);
+        assert_eq!(
+            get(&state, &format!("/w?p={}", note(2))).await["maxWithdrawable"],
+            20_000
+        );
+
+        let (k1c, hc) = bearer(3);
+        credit(&state, &hc, 20_000);
+        assert_eq!(
+            reason(&get(&state, &format!("/p/nobody?amount=20000&k1={k1c}")).await),
+            "unknown user"
+        );
+        assert_eq!(
+            reason(&get(&state, &format!("/p/mint?amount=20000&k1={k1c}")).await),
+            "unknown user"
+        );
+    }
+
+    /// A username registered before LUD-26 holds the old 64-byte cx1. It
+    /// keeps auto-minting under the old purpose-2 tweak, and its owner moves
+    /// it to a share with an update signed by the old branch key.
+    #[tokio::test]
+    async fn a_pre_lud26_address_keeps_working_until_it_is_moved() {
+        let state = app();
+        let legacy_node =
+            legacy_branch_node(&derive_cash_root(&[7; 32]).unwrap(), "mint.example").unwrap();
+        let legacy = legacy_cx1_of(&legacy_node).unwrap();
+        let on_file = hex::encode([legacy.pubkey_x_only, legacy.chain_code].concat());
+        state
+            .store
+            .register_username("alice", &on_file, &hex::encode(legacy.pubkey_x_only), None)
+            .unwrap();
+        assert_eq!(
+            get(&state, "/.well-known/lnurlp/alice").await["callback"],
+            "https://mint.example/p/alice"
+        );
+
+        let (k1, h) = bearer(1);
+        credit(&state, &h, 30_000);
+        ok(&get(&state, &format!("/p/alice?amount=30000&k1={k1}")).await);
+        let old_note =
+            legacy_derive_note_pubkey(&legacy, Some(LEGACY_PURPOSE_LIGHTNING_ADDRESS), 0).unwrap();
+        assert_eq!(
+            get(&state, &format!("/w?p={}", encode_cp1(&old_note))).await["maxWithdrawable"],
+            30_000
+        );
+        // the old cx1 is never registered anew
+        let v = form(
+            &state,
+            "POST",
+            "/.well-known/lnurlp/bob",
+            &format!("cx1={}&sig=00", encode_legacy_cx1(&legacy)),
+        )
+        .await;
+        assert_eq!(reason(&v), "Invalid cx1.");
+
+        let (key1, cx1_1) = share(1);
+        let sig = proof(&legacy_node, "update", "alice", Some(&cx1_1));
+        let newsig = proof(&key1, "register", "alice", Some(&cx1_1));
+        ok(&form(
+            &state,
+            "PUT",
+            "/.well-known/lnurlp/alice",
+            &format!("cx1={cx1_1}&sig={sig}&newsig={newsig}"),
+        )
+        .await);
+        let (k1b, hb) = bearer(2);
+        credit(&state, &hb, 20_000);
+        ok(&get(&state, &format!("/p/alice?amount=20000&k1={k1b}")).await);
+        let watched = lnurlcash_core::recoverable::decode_cx1(&cx1_1).unwrap();
+        let new_note = encode_cp1(&derive_note_pubkey(&watched, 0).unwrap());
+        assert_eq!(
+            get(&state, &format!("/w?p={new_note}")).await["maxWithdrawable"],
+            20_000
         );
     }
 

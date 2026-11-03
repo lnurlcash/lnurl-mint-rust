@@ -12,12 +12,12 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-use lnurlcash_core::recoverable::encode_cx1;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     admin_ui::{self, Auth},
+    mint::Share,
     spend,
     state::AppState,
 };
@@ -222,11 +222,15 @@ fn users_now(state: &AppState) -> AdminResult {
         .map_err(internal)?
         .into_iter()
         .map(|(username, branch_hex, next_index)| {
-            let cx1 = hex::decode(&branch_hex)
-                .ok()
-                .filter(|b| b.len() == 64)
-                .map(|b| encode_cx1(b[..32].try_into().unwrap(), b[32..].try_into().unwrap()));
-            json!({"username": username, "cx1": cx1, "next_index": next_index})
+            let share = Share::on_file(&branch_hex);
+            json!({
+                "username": username,
+                "cx1": share.as_ref().map(Share::cx1),
+                // registered before LUD-26: auto-mints under the old tweak
+                // until its owner moves it to a share
+                "legacy": share.as_ref().is_some_and(Share::is_legacy),
+                "next_index": next_index,
+            })
         })
         .collect();
     Ok(Json(json!({"users": users})))

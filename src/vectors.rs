@@ -4,6 +4,8 @@ use lnurlcash_core::{
     recoverable::{decode_cx1, derive_note_pubkey, encode_cs1_with_amount},
     signature::note_signature_message_for_hash,
 };
+
+use crate::mint::{Share, proves, share_note_id};
 use serde_json::Value;
 
 use crate::spend;
@@ -41,8 +43,8 @@ fn certificates_encode_as_the_vectors_do() {
     for case in v["cases"].as_array().unwrap() {
         let amount = case["amount_msat"].as_u64().unwrap();
         assert_eq!(
-            note_signature_message_for_hash(s(v, "Q"), amount),
-            s(case, "message")
+            note_signature_message_for_hash(s(v, "Q"), s(v, "domain"), amount).as_deref(),
+            Some(s(case, "message"))
         );
         let sig: [u8; 65] = hex::decode(s(case, "signature"))
             .unwrap()
@@ -78,16 +80,31 @@ fn bearer_note_every_form_names_one_note() {
 }
 
 #[test]
-fn cx1_derivation_matches_every_note() {
-    for branch in vectors("26")["derivation"].as_array().unwrap() {
-        let cx1 = decode_cx1(s(branch, "cx1")).unwrap();
-        for note in branch["notes"].as_array().unwrap() {
-            let purpose = note["purpose"].as_u64().unwrap() as u32;
-            let i = note["i"].as_u64().unwrap() as u32;
-            let q = derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, purpose, i).unwrap();
-            // Q is given compressed; its x is the note
-            assert_eq!(hex::encode(q), s(note, "Q")[2..]);
-            assert_eq!(spend::note_id_of_ref(s(note, "cp1")), Some(hex::encode(q)));
+fn lud26_key_path_spend_opens_its_odd_y_note() {
+    let v = &vectors("26")["key_path_spend"];
+    let parsed = spend::parse(s(v, "ck1")).unwrap();
+    assert_eq!(parsed.note_id, s(v, "Q"));
+    assert_eq!(spend::verify(&parsed, 0, &[s(v, "domain").into()], 1), None);
+}
+
+/// What this mint credits a registered share with: every share note in the
+/// vectors, from its cx1 alone, the way the share is kept on file.
+#[test]
+fn a_share_on_file_derives_every_share_note() {
+    for derivation in vectors("26")["derivation"].as_array().unwrap() {
+        for account in derivation["accounts"].as_array().unwrap() {
+            for share in account["shareable"].as_array().unwrap() {
+                let cx1 = decode_cx1(s(share, "cx1")).unwrap();
+                let on_file = hex::encode([&cx1.chain_code[..], &cx1.pubkey[..]].concat());
+                assert_eq!(Share::on_file(&on_file).unwrap().cx1(), s(share, "cx1"));
+                for note in share["notes"].as_array().unwrap() {
+                    let i = note["i"].as_u64().unwrap() as u32;
+                    let q = derive_note_pubkey(&cx1, i).unwrap();
+                    assert_eq!(hex::encode(q), s(note, "Q"));
+                    assert_eq!(share_note_id(&on_file, i), Some(hex::encode(q)));
+                    assert_eq!(spend::note_id_of_ref(s(note, "cp1")), Some(hex::encode(q)));
+                }
+            }
         }
     }
 }
@@ -96,25 +113,29 @@ fn cx1_derivation_matches_every_note() {
 fn registration_proofs_verify() {
     let v = vectors("26");
     let reg = &v["registration"];
-    let cx1 = decode_cx1(s(&v["derivation"][1], "cx1")).unwrap();
-    let branch_hex = hex::encode([cx1.pubkey_x_only, cx1.chain_code].concat());
     let (domain, username) = (s(reg, "domain"), s(reg, "username"));
-    for action in ["register", "unregister"] {
-        let sig = s(&reg[action], "sig");
-        assert!(crate::mint::owns_branch(
-            action,
-            domain,
-            username,
-            &branch_hex,
-            sig
-        ));
+    let (cx1, new_cx1) = (s(reg, "cx1"), s(reg, "new_cx1"));
+    let xp = |value: &str| decode_cx1(value).unwrap().pubkey_x_only();
+    for (proof, action, bound, signer) in [
+        (&reg["register"], "register", Some(cx1), cx1),
+        (&reg["update"]["sig"], "update", Some(new_cx1), cx1),
+        (&reg["update"]["newsig"], "register", Some(new_cx1), new_cx1),
+        (&reg["unregister"], "unregister", None, new_cx1),
+    ] {
+        let sig = s(proof, "sig");
+        assert!(
+            proves(action, domain, username, bound, xp(signer), sig),
+            "{action}"
+        );
+        // by any other key, or for another action, it proves nothing
+        let other = if signer == cx1 { new_cx1 } else { cx1 };
+        assert!(
+            !proves(action, domain, username, bound, xp(other), sig),
+            "{action}"
+        );
+        assert!(
+            !proves("delete", domain, username, bound, xp(signer), sig),
+            "{action}"
+        );
     }
-    let register_sig = s(&reg["register"], "sig");
-    assert!(!crate::mint::owns_branch(
-        "unregister",
-        domain,
-        username,
-        &branch_hex,
-        register_sig
-    ));
 }

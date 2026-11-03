@@ -609,9 +609,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.6"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
+checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
 dependencies = [
  "cmov",
  "subtle",
@@ -1718,9 +1718,9 @@ dependencies = [
 
 [[package]]
 name = "lnurlcash-core"
-version = "0.2.4"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f6c6f563426af7cd5942b271c4ddf3aa842e413474d95bcf6099cd5bc1d42a7"
+checksum = "c465b25abc7e2c48fdac3396ee4701f4a53e7332f3bfdca6ad7d54275530c741"
 dependencies = [
  "bech32 0.12.0",
  "hex",
