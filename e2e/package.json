@@ -9,7 +9,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
-    "lnurlcash-conformance": "0.15.0",
+    "lnurlcash-conformance": "0.16.1",
     "playwright": "1.63.0"
   }
 }
