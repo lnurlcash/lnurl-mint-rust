@@ -1718,9 +1718,9 @@ dependencies = [
 
 [[package]]
 name = "lnurlcash-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98a793fb3902f48596584a3fd9fbf368f1f0fa73b400a6d478fc4be0ec2b622b"
+checksum = "c465b25abc7e2c48fdac3396ee4701f4a53e7332f3bfdca6ad7d54275530c741"
 dependencies = [
  "bech32 0.12.0",
  "hex",
